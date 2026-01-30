@@ -1,0 +1,14 @@
+[project]
+name = "modal-agent"
+version = "0.1.0"
+description = "Modal agent executor for Human-in-the-Loop Agent System"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk",
+    "httpx",
+    "modal",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
