@@ -1,22 +1,44 @@
 "use client";
 
-import type { Message as AIMessage } from "ai";
 import { AnimatePresence, motion } from "motion/react";
 import { memo } from "react";
 import { Streamdown } from "streamdown";
 import { cn } from "@/lib/utils";
 import { SparklesIcon } from "lucide-react";
+import { InlineAgentStatus, type TaskResult } from "./inline-agent-status";
+import type { ExtendedMessage } from "./messages";
+
+interface MessageProps {
+  message: ExtendedMessage;
+  isLoading: boolean;
+  status: string;
+  isLatestMessage: boolean;
+  onClarificationResponse?: (response: string) => void;
+  onAgentComplete?: (result: TaskResult) => void;
+  onAgentFail?: (error: string) => void;
+}
 
 const PurePreviewMessage = ({
   message,
   isLatestMessage,
   status,
-}: {
-  message: AIMessage;
-  isLoading: boolean;
-  status: string;
-  isLatestMessage: boolean;
-}) => {
+  onClarificationResponse,
+  onAgentComplete,
+  onAgentFail,
+}: MessageProps) => {
+  // Render inline agent status for pending agent messages
+  if (message.isAgentPending && message.agentTaskId) {
+    return (
+      <InlineAgentStatus
+        taskId={message.agentTaskId}
+        messageId={message.id}
+        onClarificationResponse={onClarificationResponse || (() => {})}
+        onComplete={onAgentComplete || (() => {})}
+        onFail={onAgentFail || (() => {})}
+      />
+    );
+  }
+
   return (
     <AnimatePresence key={message.id}>
       <motion.div
@@ -71,5 +93,7 @@ const PurePreviewMessage = ({
 export const Message = memo(PurePreviewMessage, (prevProps, nextProps) => {
   if (prevProps.status !== nextProps.status) return false;
   if (prevProps.message.content !== nextProps.message.content) return false;
+  if (prevProps.message.isAgentPending !== nextProps.message.isAgentPending) return false;
+  if (prevProps.message.agentTaskId !== nextProps.message.agentTaskId) return false;
   return true;
 });

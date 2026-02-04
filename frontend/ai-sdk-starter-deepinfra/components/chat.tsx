@@ -2,23 +2,25 @@
 
 import { defaultModel, type modelID } from "@/ai/providers";
 import { useChat } from "@ai-sdk/react";
-import { useState } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { Textarea } from "./textarea";
 import { ProjectOverview } from "./project-overview";
-import { Messages } from "./messages";
+import { Messages, type ExtendedMessage } from "./messages";
 import { Header } from "./header";
 import { toast } from "sonner";
-import { ModeToggle } from "./mode-toggle";
-import { StatusPanel } from "./status-panel";
-
-export type AppMode = "chat" | "action";
+import type { TaskResult } from "./inline-agent-status";
 
 export default function Chat() {
   const [selectedModel, setSelectedModel] = useState<modelID>(defaultModel);
-  const [mode, setMode] = useState<AppMode>("chat");
+  const [actionEnabled, setActionEnabled] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [pendingMessages, setPendingMessages] = useState<ExtendedMessage[]>([]);
 
-  const { messages, input, setInput, handleSubmit, isLoading, stop } = useChat({
+  // Chat session ID for grouping agent tasks and enabling conversation resume
+  // Using ref for immediate access in handlers without re-renders
+  const chatSessionIdRef = useRef<string | null>(null);
+
+  const { messages: chatMessages, input, setInput, handleSubmit, isLoading, stop } = useChat({
     body: { selectedModel },
     onError: (error) => {
       toast.error(
@@ -30,34 +32,90 @@ export default function Chat() {
     },
   });
 
+  // Unified message list combining chat messages and pending action messages
+  const allMessages = useMemo(() => {
+    const chatExtended: ExtendedMessage[] = chatMessages.map(m => ({
+      ...m,
+      isAgentPending: false,
+      agentTaskId: undefined,
+    }));
+    return [...chatExtended, ...pendingMessages].sort(
+      (a, b) => new Date(a.createdAt!).getTime() - new Date(b.createdAt!).getTime()
+    );
+  }, [chatMessages, pendingMessages]);
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (mode === "chat") {
+    if (!actionEnabled) {
       // Standard chat mode - use Vercel AI SDK
       handleSubmit(e);
     } else {
       // Action mode - start agent task
+      const userMessage = input;
+      const userMsgId = crypto.randomUUID();
+      const pendingMsgId = crypto.randomUUID();
+
       try {
-        const sessionId = crypto.randomUUID(); // TODO: Use actual session from DB
+        // Add user message and pending assistant message immediately
+        setPendingMessages((prev) => [
+          ...prev,
+          {
+            id: userMsgId,
+            role: "user",
+            content: userMessage,
+            createdAt: new Date(),
+          },
+          {
+            id: pendingMsgId,
+            role: "assistant",
+            content: "",
+            isAgentPending: true,
+            createdAt: new Date(),
+          },
+        ]);
+
+        setInput("");
+
+        // Start agent task with chat session ID for context continuity
         const response = await fetch("/api/agent/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, task: input }),
+          body: JSON.stringify({
+            task: userMessage,
+            chatSessionId: chatSessionIdRef.current, // Pass existing session if we have one
+          }),
         });
         const data = await response.json();
+
         if (data.taskId) {
+          // Store the chat session ID for future tasks
+          if (data.chatSessionId) {
+            chatSessionIdRef.current = data.chatSessionId;
+          }
+
+          // Update pending message with taskId to start SSE connection
+          setPendingMessages((prev) =>
+            prev.map((m) =>
+              m.id === pendingMsgId ? { ...m, agentTaskId: data.taskId } : m
+            )
+          );
           setActiveTaskId(data.taskId);
-          setInput("");
-          toast.success("Agent task started!", { position: "top-center" });
+        } else {
+          throw new Error(data.error || "No taskId returned");
         }
-      } catch {
-        toast.error("Failed to start agent task", { position: "top-center" });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to start agent task";
+        toast.error(message, { position: "top-center" });
+        // Remove the pending messages on error
+        setPendingMessages((prev) =>
+          prev.filter((m) => m.id !== userMsgId && m.id !== pendingMsgId)
+        );
       }
     }
   };
 
-  const handleClarificationResponse = async (response: string) => {
+  const handleClarificationResponse = useCallback(async (response: string) => {
     if (!activeTaskId) return;
 
     try {
@@ -70,37 +128,63 @@ export default function Chat() {
     } catch {
       toast.error("Failed to send response", { position: "top-center" });
     }
-  };
+  }, [activeTaskId]);
+
+  const handleAgentComplete = useCallback((result: TaskResult) => {
+    // Transform pending message to final assistant message
+    setPendingMessages((prev) =>
+      prev.map((m) =>
+        m.agentTaskId === activeTaskId
+          ? {
+              ...m,
+              content: result.summary,
+              isAgentPending: false,
+              agentTaskId: undefined,
+            }
+          : m
+      )
+    );
+    setActiveTaskId(null);
+  }, [activeTaskId]);
+
+  const handleAgentFail = useCallback((error: string) => {
+    // Transform pending message to show error
+    setPendingMessages((prev) =>
+      prev.map((m) =>
+        m.agentTaskId === activeTaskId
+          ? {
+              ...m,
+              content: `Task failed: ${error}`,
+              isAgentPending: false,
+              agentTaskId: undefined,
+            }
+          : m
+      )
+    );
+    setActiveTaskId(null);
+    toast.error(error, { position: "top-center" });
+  }, [activeTaskId]);
 
   // Derive status for backwards compatibility with Textarea component
-  const status = isLoading ? "streaming" : "ready";
+  const status = isLoading || activeTaskId ? "streaming" : "ready";
 
   return (
     <div className="flex flex-col justify-center w-full h-dvh stretch">
       <Header />
 
-      {/* Mode Toggle */}
-      <div className="mx-auto w-full max-w-xl px-4 sm:px-0">
-        <ModeToggle mode={mode} onModeChange={setMode} disabled={isLoading || !!activeTaskId} />
-      </div>
-
-      {/* Status Panel (visible in action mode when task is active) */}
-      {mode === "action" && activeTaskId && (
-        <div className="mx-auto w-full max-w-xl px-4 sm:px-0">
-          <StatusPanel
-            taskId={activeTaskId}
-            onClarificationResponse={handleClarificationResponse}
-            onTaskComplete={() => setActiveTaskId(null)}
-          />
-        </div>
-      )}
-
-      {messages.length === 0 && !activeTaskId ? (
+      {allMessages.length === 0 ? (
         <div className="mx-auto w-full max-w-xl">
-          <ProjectOverview mode={mode} />
+          <ProjectOverview />
         </div>
       ) : (
-        <Messages messages={messages} isLoading={isLoading} status={status} />
+        <Messages
+          messages={allMessages}
+          isLoading={isLoading || !!activeTaskId}
+          status={status}
+          onClarificationResponse={handleClarificationResponse}
+          onAgentComplete={handleAgentComplete}
+          onAgentFail={handleAgentFail}
+        />
       )}
 
       <form
@@ -112,10 +196,12 @@ export default function Chat() {
           setSelectedModel={setSelectedModel}
           handleInputChange={(e) => setInput(e.currentTarget.value)}
           input={input}
-          isLoading={isLoading}
+          isLoading={isLoading || !!activeTaskId}
           status={status}
           stop={stop}
-          mode={mode}
+          actionEnabled={actionEnabled}
+          onActionToggle={setActionEnabled}
+          disableToggle={!!activeTaskId}
         />
       </form>
     </div>

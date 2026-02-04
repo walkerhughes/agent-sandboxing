@@ -1,6 +1,7 @@
 """Custom tools for the agent, including AskUser for human-in-the-loop."""
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 
 class AskUserException(Exception):
@@ -21,17 +22,21 @@ class AskUserException(Exception):
         super().__init__(f"AskUser: {question}")
 
 
-def create_ask_user_tool():
+@dataclass
+class Tool:
+    """Represents a tool that can be used by the agent."""
+    name: str
+    description: str
+    handler: Callable
+
+
+def create_ask_user_tool() -> Tool:
     """
-    Create the AskUser MCP tool for the agent.
+    Create the AskUser tool for the agent.
 
     When called, this raises AskUserException to checkpoint the agent.
     """
-    from claude_agent_sdk import tool
-
-    @tool(
-        "AskUser",
-        """Ask the user for clarification when you need more information to proceed.
+    description = """Ask the user for clarification when you need more information to proceed.
 Use this when:
 - The task is ambiguous and could be interpreted multiple ways
 - You need to confirm a destructive or irreversible action
@@ -41,14 +46,9 @@ Use this when:
 Do NOT use this for:
 - Routine progress updates (use status messages instead)
 - Rhetorical questions
-- Asking permission for every small step""",
-        {
-            "question": str,
-            "context": str,
-            "options": list,  # Optional list of suggested answers
-        }
-    )
-    async def ask_user(args: dict[str, Any]) -> dict[str, Any]:
+- Asking permission for every small step"""
+
+    async def handler(args: dict[str, Any]) -> dict[str, Any]:
         """
         This tool raises an exception to trigger checkpoint/resume.
         The executor catches this and handles the webhook/exit flow.
@@ -59,4 +59,8 @@ Do NOT use this for:
             options=args.get("options", [])
         )
 
-    return ask_user
+    return Tool(
+        name="AskUser",
+        description=description,
+        handler=handler,
+    )
