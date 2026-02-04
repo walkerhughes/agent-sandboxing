@@ -82,6 +82,8 @@ async def execute_agent(
         # Configure agent options
         # Per docs: use resume=session_id to continue a previous session
         options = ClaudeAgentOptions(
+            # Specify model to use
+            model="sonnet",
             # Use Claude Code's preset system prompt
             system_prompt={"type": "preset", "preset": "claude_code"},
             # Resume from previous session if provided
