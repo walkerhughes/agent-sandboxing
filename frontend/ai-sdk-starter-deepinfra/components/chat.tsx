@@ -47,12 +47,21 @@ export default function Chat() {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!actionEnabled) {
+    // Detect /plan-feature command - auto-route to Action Mode
+    const isPlanFeatureCommand = input.trim().toLowerCase().startsWith("/plan-feature");
+    const shouldUseAction = actionEnabled || isPlanFeatureCommand;
+
+    // Strip /plan-feature prefix if present (Modal will add it back)
+    const cleanedInput = isPlanFeatureCommand
+      ? input.trim().replace(/^\/plan-feature\s*/i, "")
+      : input;
+
+    if (!shouldUseAction) {
       // Standard chat mode - use Vercel AI SDK
       handleSubmit(e);
     } else {
       // Action mode - start agent task
-      const userMessage = input;
+      const userMessage = cleanedInput || input; // Use cleaned input, fallback to original if empty
       const userMsgId = crypto.randomUUID();
       const pendingMsgId = crypto.randomUUID();
 
@@ -77,13 +86,21 @@ export default function Chat() {
 
         setInput("");
 
-        // Start agent task with chat session ID for context continuity
+        // Build chat context from current conversation to pass to Modal agent
+        // This gives the agent context from Chat Mode when entering Action Mode
+        const chatContext = chatMessages.map(m => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        }));
+
+        // Start agent task with chat session ID and conversation context
         const response = await fetch("/api/agent/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             task: userMessage,
             chatSessionId: chatSessionIdRef.current, // Pass existing session if we have one
+            chatContext, // Pass Chat Mode conversation for context
           }),
         });
         const data = await response.json();

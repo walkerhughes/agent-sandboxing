@@ -1,9 +1,14 @@
 """Modal app configuration for the agent executor."""
 
+from pathlib import Path
+
 import modal
 
 # Create Modal app
 app = modal.App("human-in-the-loop-agent")
+
+# Path to this directory (modal_agent/)
+MODAL_AGENT_DIR = Path(__file__).parent.absolute()
 
 # Container image with dependencies
 # Agent SDK requires: Node.js 18+ and Claude Code CLI
@@ -24,6 +29,12 @@ image = (
         "claude-agent-sdk",
         "httpx",
         "fastapi",  # Required for @modal.web_endpoint
+    )
+    # Add .claude folder with skills and agents (Modal 1.0+ API)
+    # This makes the /plan-feature command and subagents available in the container
+    .add_local_dir(
+        str(MODAL_AGENT_DIR / ".claude"),
+        remote_path="/app/.claude",
     )
 )
 
@@ -47,3 +58,6 @@ WEB_ENDPOINT_CONFIG = {
     "secrets": SECRETS,
     "timeout": 60,  # Web endpoint just spawns, doesn't run agent
 }
+
+# Remote path where .claude folder is mounted in the container
+CLAUDE_FOLDER_PATH = "/app"

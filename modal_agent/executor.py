@@ -35,7 +35,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
-from .config import app, FUNCTION_CONFIG, WEB_ENDPOINT_CONFIG
+from .config import app, FUNCTION_CONFIG, WEB_ENDPOINT_CONFIG, CLAUDE_FOLDER_PATH
 from .tools import AskUserException, create_ask_user_tool
 from .webhook import (
     send_session_started,
@@ -52,6 +52,7 @@ async def execute_agent(
     prompt: str,
     webhook_url: str,
     resume_session_id: str | None = None,
+    chat_context: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     Execute the agent loop with checkpoint/resume support.
@@ -61,6 +62,8 @@ async def execute_agent(
         prompt: User's task description (or clarification response if resuming)
         webhook_url: Vercel webhook endpoint for events
         resume_session_id: Session ID to resume (None for new task)
+        chat_context: Previous chat messages for context (new sessions only)
+                      Format: [{"role": "user"|"assistant", "content": "..."}]
 
     Returns:
         Final result dict with session_id, status, and result/error
@@ -79,20 +82,44 @@ async def execute_agent(
             tools=[ask_user_tool]
         )
 
+        # Build system prompt with optional chat context appended
+        # Using append keeps context available throughout the session
+        system_prompt_config: dict = {"type": "preset", "preset": "claude_code"}
+
+        if chat_context and not resume_session_id:
+            # New session with chat history: append context to system prompt
+            context_lines = [
+                "",
+                "# Prior Conversation Context",
+                "The user had the following conversation before starting this action task.",
+                "Use this context to understand their goals and any decisions already made.",
+                "",
+            ]
+            for msg in chat_context:
+                role = msg.get("role", "user").capitalize()
+                content = msg.get("content", "")
+                context_lines.append(f"**{role}**: {content}")
+            context_lines.append("")
+
+            system_prompt_config["append"] = "\n".join(context_lines)
+            print(f"[Agent] Appending {len(chat_context)} chat messages to system prompt")
+
         # Configure agent options
         # Per docs: use resume=session_id to continue a previous session
         options = ClaudeAgentOptions(
-            # Specify model to use
+            # Specify model to use (SDK accepts: "sonnet", "opus", "haiku")
             model="sonnet",
-            # Use Claude Code's preset system prompt
-            system_prompt={"type": "preset", "preset": "claude_code"},
+            # Use Claude Code's preset system prompt (with optional append for chat context)
+            system_prompt=system_prompt_config,
             # Resume from previous session if provided
             # The SDK automatically handles loading conversation history
             resume=resume_session_id,
-            # Standard coding tools + our custom AskUser
+            # Standard coding tools + our custom AskUser + Task for subagents
             allowed_tools=[
                 "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-                "mcp__agent__AskUser"
+                "Task",  # Required for invoking subagents
+                "AskUserQuestion",  # Built-in tool for clarifications
+                "mcp__agent__AskUser"  # Our custom MCP tool
             ],
             # Auto-accept file edits (sandboxed environment)
             permission_mode="acceptEdits",
@@ -100,18 +127,27 @@ async def execute_agent(
             mcp_servers={"agent": agent_server},
             # Limit turns to prevent runaway
             max_turns=50,
+            # Load project settings to discover .claude folder plugins
+            # This enables filesystem-based agents and commands
+            setting_sources=["project"],
+            # Set working directory to /app where .claude folder is mounted in container
+            cwd=CLAUDE_FOLDER_PATH,
         )
 
-        # Log resume status
+        # Log resume status and construct the actual prompt to send
         if resume_session_id:
+            # Resuming: user's response continues the existing conversation
             print(f"[Agent] Resuming session: {resume_session_id}")
+            actual_prompt = prompt
         else:
-            print("[Agent] Starting new session")
+            # New session: invoke /plan-feature skill with user's feature description
+            print("[Agent] Starting new session with /plan-feature")
+            actual_prompt = f"/plan-feature {prompt}"
 
         # Run agent with ClaudeSDKClient
         async with ClaudeSDKClient(options=options) as client:
-            # Send the prompt
-            await client.query(prompt)
+            # Send the prompt (either /plan-feature <desc> or user's clarification response)
+            await client.query(actual_prompt)
 
             # Process messages
             async for message in client.receive_messages():
@@ -247,7 +283,8 @@ async def spawn_agent(request: Request) -> JSONResponse:
         "task_id": "uuid",
         "prompt": "user task description",
         "webhook_url": "https://your-app.vercel.app/api/agent/webhook",
-        "resume_session_id": "optional-session-id-for-resume"
+        "resume_session_id": "optional-session-id-for-resume",
+        "chat_context": [{"role": "user", "content": "..."}, ...] (optional)
     }
 
     Returns immediately with 202 Accepted, then runs agent asynchronously.
@@ -259,6 +296,7 @@ async def spawn_agent(request: Request) -> JSONResponse:
         prompt = body.get("prompt")
         webhook_url = body.get("webhook_url")
         resume_session_id = body.get("resume_session_id")
+        chat_context = body.get("chat_context")  # Optional: prior chat messages
 
         if not task_id or not prompt or not webhook_url:
             return JSONResponse(
@@ -270,7 +308,8 @@ async def spawn_agent(request: Request) -> JSONResponse:
         if resume_session_id:
             print(f"[Spawn] Resuming task {task_id} with session {resume_session_id}")
         else:
-            print(f"[Spawn] Starting new task {task_id}")
+            context_msg = f" with {len(chat_context)} chat messages" if chat_context else ""
+            print(f"[Spawn] Starting new task {task_id}{context_msg}")
 
         # Spawn the agent execution asynchronously (non-blocking)
         # This creates a new container that runs independently
@@ -279,6 +318,7 @@ async def spawn_agent(request: Request) -> JSONResponse:
             prompt=prompt,
             webhook_url=webhook_url,
             resume_session_id=resume_session_id,
+            chat_context=chat_context,  # Pass chat history for new sessions
         )
 
         return JSONResponse(

@@ -51,9 +51,18 @@ ${historyText}
 ${currentTask}`;
 }
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export async function POST(req: Request) {
   try {
-    const { task, chatSessionId } = await req.json();
+    const { task, chatSessionId, chatContext } = await req.json() as {
+      task: string;
+      chatSessionId?: string;
+      chatContext?: ChatMessage[];
+    };
 
     if (!task) {
       return NextResponse.json(
@@ -144,11 +153,13 @@ export async function POST(req: Request) {
 
     // Spawn Modal container with session context
     // If the session has an agentSessionId, we can resume the Claude SDK session
+    // Pass chatContext for system prompt injection (Chat Mode conversation)
     await spawnModalAgent({
       taskId,
-      prompt: contextualPrompt,
+      prompt: task, // Just the user's task, not the contextualPrompt (context goes in system prompt)
       webhookUrl,
       resumeSessionId: session.agentSessionId || undefined,
+      chatContext: chatContext || [], // Chat Mode messages for system prompt append
     });
 
     // Update task status to running

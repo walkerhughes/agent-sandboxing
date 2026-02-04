@@ -7,11 +7,17 @@
 
 const MODAL_ENDPOINT_URL = process.env.MODAL_ENDPOINT_URL;
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 interface SpawnAgentOptions {
   taskId: string;
   prompt: string;
   webhookUrl: string;
   resumeSessionId?: string;
+  chatContext?: ChatMessage[];
 }
 
 interface SpawnAgentResponse {
@@ -28,7 +34,7 @@ interface SpawnAgentResponse {
  * 3. Container sends webhooks back to Vercel as it progresses
  */
 export async function spawnModalAgent(options: SpawnAgentOptions): Promise<SpawnAgentResponse> {
-  const { taskId, prompt, webhookUrl, resumeSessionId } = options;
+  const { taskId, prompt, webhookUrl, resumeSessionId, chatContext } = options;
 
   if (!MODAL_ENDPOINT_URL) {
     throw new Error(
@@ -41,6 +47,7 @@ export async function spawnModalAgent(options: SpawnAgentOptions): Promise<Spawn
     prompt: prompt.slice(0, 100) + (prompt.length > 100 ? "..." : ""),
     webhookUrl,
     resumeSessionId: resumeSessionId || "new session",
+    chatContextLength: chatContext?.length || 0,
   });
 
   const response = await fetch(MODAL_ENDPOINT_URL, {
@@ -53,6 +60,7 @@ export async function spawnModalAgent(options: SpawnAgentOptions): Promise<Spawn
       prompt,
       webhook_url: webhookUrl,
       resume_session_id: resumeSessionId,
+      chat_context: chatContext, // Pass to Modal for system prompt injection
     }),
   });
 
