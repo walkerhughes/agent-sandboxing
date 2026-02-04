@@ -17,6 +17,10 @@ model ChatSession {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+  // Claude Agent SDK session ID for multi-turn conversation resume
+  // This allows the agent to maintain context across multiple tasks
+  agentSessionId String? @map("agent_session_id")
+
   messages ChatMessage[]
   tasks    AgentTask[]
 
@@ -38,13 +42,13 @@ model ChatMessage {
 
 // Agent tasks (action mode executions)
 model AgentTask {
-  id        String   @id @default(uuid())
-  sessionId String   @map("session_id")
+  id        String  @id @default(uuid())
+  sessionId String? @map("session_id")
 
   // Task state: pending | running | awaiting_input | completed | failed | cancelled
   status String @default("pending")
 
-  // Claude Agent SDK session ID (this is ALL we need for resume!)
+  // Claude Agent SDK session ID (for multi-turn resume)
   agentSessionId String? @map("agent_session_id")
 
   // Original task prompt
@@ -67,7 +71,7 @@ model AgentTask {
   updatedAt   DateTime  @updatedAt @map("updated_at")
   completedAt DateTime? @map("completed_at")
 
-  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  session ChatSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId, status], name: "idx_agent_tasks_session_status")
   @@map("agent_tasks")

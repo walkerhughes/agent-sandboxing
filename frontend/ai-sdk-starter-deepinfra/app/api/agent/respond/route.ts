@@ -8,10 +8,9 @@
  */
 
 import { NextResponse } from "next/server";
-
-// TODO: Import prisma client and Modal spawn function
-// import { prisma } from "@/lib/db";
-// import { spawnModalAgent } from "@/lib/modal";
+import { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/db";
+import { spawnModalAgent } from "@/lib/modal";
 
 export async function POST(req: Request) {
   try {
@@ -24,32 +23,57 @@ export async function POST(req: Request) {
       );
     }
 
-    // TODO: Fetch task and validate it's awaiting input
-    // const task = await prisma.agentTask.findUnique({
-    //   where: { id: taskId },
-    // });
-    //
-    // if (!task || task.status !== "awaiting_input") {
-    //   return NextResponse.json(
-    //     { error: "Task not found or not awaiting input" },
-    //     { status: 400 }
-    //   );
-    // }
+    // Fetch task and validate it's awaiting input
+    const task = await prisma.agentTask.findUnique({
+      where: { id: taskId },
+    });
 
-    // TODO: Update task status
-    // await prisma.agentTask.update({
-    //   where: { id: taskId },
-    //   data: {
-    //     status: "running",
-    //     pendingClarification: null,
-    //   },
-    // });
+    if (!task) {
+      return NextResponse.json(
+        { error: "Task not found" },
+        { status: 404 }
+      );
+    }
 
-    // TODO: Spawn NEW Modal container with resume
-    // const webhookUrl = `${process.env.VERCEL_URL}/api/agent/webhook`;
-    // await spawnModalAgent(taskId, response, webhookUrl, task.agentSessionId);
+    if (task.status !== "awaiting_input") {
+      return NextResponse.json(
+        { error: `Task is not awaiting input (status: ${task.status})` },
+        { status: 400 }
+      );
+    }
 
-    console.log(`[Agent Respond] Resuming task ${taskId} with response`);
+    if (!task.agentSessionId) {
+      return NextResponse.json(
+        { error: "Task has no agent session to resume" },
+        { status: 400 }
+      );
+    }
+
+    // Update task status to running
+    await prisma.agentTask.update({
+      where: { id: taskId },
+      data: {
+        status: "running",
+        pendingClarification: Prisma.DbNull,
+      },
+    });
+
+    // Build webhook URL
+    // Use PUBLIC_URL for tunneled local dev (ngrok/cloudflared), VERCEL_URL for prod
+    const baseUrl = process.env.PUBLIC_URL || process.env.VERCEL_URL || "http://localhost:3000";
+    const webhookUrl = `${baseUrl}/api/agent/webhook`;
+
+    // Spawn NEW Modal container with resume session ID
+    // The response becomes the new prompt, and the session ID allows
+    // Claude SDK to load the full conversation context
+    await spawnModalAgent({
+      taskId,
+      prompt: response,
+      webhookUrl,
+      resumeSessionId: task.agentSessionId,
+    });
+
+    console.log(`[Agent Respond] Resuming task ${taskId} with session ${task.agentSessionId}`);
 
     return NextResponse.json({ ok: true });
   } catch (error) {

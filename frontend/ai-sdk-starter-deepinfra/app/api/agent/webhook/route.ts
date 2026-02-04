@@ -2,15 +2,16 @@
  * POST /api/agent/webhook
  *
  * Receive events from Modal agent containers.
- * Events are published to Redis for real-time SSE delivery.
+ * Events update the database and are published to Redis for real-time SSE delivery.
+ *
+ * Key feature: Stores agentSessionId at BOTH task and session level
+ * for multi-turn conversation resume capability.
  */
 
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-
-// TODO: Import prisma client and redis
-// import { prisma } from "@/lib/db";
-// import { redis } from "@/lib/redis";
+import { prisma } from "@/lib/db";
+import { publish } from "@/lib/redis";
 
 // Webhook event types from Modal
 type WebhookEvent =
@@ -57,74 +58,110 @@ export async function POST(req: Request) {
 
     // Handle different event types
     switch (event.type) {
-      case "session_started":
-        // TODO: Update task with session ID
-        // await prisma.agentTask.update({
-        //   where: { id: event.taskId },
-        //   data: {
-        //     agentSessionId: event.sessionId,
-        //     status: "running",
-        //   },
-        // });
+      case "session_started": {
+        // Store the Claude SDK session ID for resume capability
+        // Update BOTH the task AND the parent chat session
+        const task = await prisma.agentTask.update({
+          where: { id: event.taskId },
+          data: {
+            agentSessionId: event.sessionId,
+            status: "running",
+          },
+          select: { sessionId: true },
+        });
+
+        // Also update the ChatSession's agentSessionId for cross-task resume
+        if (task.sessionId) {
+          await prisma.chatSession.update({
+            where: { id: task.sessionId },
+            data: { agentSessionId: event.sessionId },
+          });
+          console.log(`[Webhook] Updated ChatSession ${task.sessionId} with agentSessionId ${event.sessionId}`);
+        }
+
+        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
+      }
 
       case "status_update":
-        // TODO: Append to status updates and publish to Redis
-        // await prisma.agentTask.update({
-        //   where: { id: event.taskId },
-        //   data: {
-        //     statusUpdates: {
-        //       push: {
-        //         message: event.message,
-        //         tool: event.tool,
-        //         timestamp: new Date().toISOString(),
-        //       },
-        //     },
-        //   },
-        // });
-        // await redis.publish(`task:${event.taskId}`, JSON.stringify(event));
+        // Append to status updates and publish to Redis for real-time UI
+        await prisma.agentTask.update({
+          where: { id: event.taskId },
+          data: {
+            statusUpdates: {
+              push: {
+                message: event.message,
+                tool: event.tool,
+                timestamp: new Date().toISOString(),
+              },
+            },
+          },
+        });
+        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
 
-      case "clarification_needed":
-        // TODO: Update task to awaiting_input
-        // await prisma.agentTask.update({
-        //   where: { id: event.taskId },
-        //   data: {
-        //     status: "awaiting_input",
-        //     agentSessionId: event.sessionId,
-        //     pendingClarification: {
-        //       question: event.question,
-        //       context: event.context,
-        //       options: event.options || [],
-        //     },
-        //   },
-        // });
-        // await redis.publish(`task:${event.taskId}`, JSON.stringify(event));
-        break;
+      case "clarification_needed": {
+        // Container is exiting - store session ID for resume
+        const task = await prisma.agentTask.update({
+          where: { id: event.taskId },
+          data: {
+            status: "awaiting_input",
+            agentSessionId: event.sessionId,
+            pendingClarification: {
+              question: event.question,
+              context: event.context,
+              options: event.options || [],
+            },
+          },
+          select: { sessionId: true },
+        });
 
-      case "completed":
-        // TODO: Update task to completed
-        // await prisma.agentTask.update({
-        //   where: { id: event.taskId },
-        //   data: {
-        //     status: "completed",
-        //     result: event.result,
-        //     completedAt: new Date(),
-        //   },
-        // });
-        // await redis.publish(`task:${event.taskId}`, JSON.stringify(event));
+        // Also update ChatSession for cross-task resume
+        if (task.sessionId) {
+          await prisma.chatSession.update({
+            where: { id: task.sessionId },
+            data: { agentSessionId: event.sessionId },
+          });
+        }
+
+        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
+      }
+
+      case "completed": {
+        const task = await prisma.agentTask.update({
+          where: { id: event.taskId },
+          data: {
+            status: "completed",
+            agentSessionId: event.sessionId,
+            result: event.result,
+            completedAt: new Date(),
+          },
+          select: { sessionId: true },
+        });
+
+        // Update ChatSession with latest session ID for future tasks
+        if (task.sessionId) {
+          await prisma.chatSession.update({
+            where: { id: task.sessionId },
+            data: { agentSessionId: event.sessionId },
+          });
+          console.log(`[Webhook] Task completed, ChatSession ${task.sessionId} agentSessionId updated`);
+        }
+
+        await publish(`task:${event.taskId}`, JSON.stringify(event));
+        break;
+      }
 
       case "failed":
-        // TODO: Update task to failed
-        // await prisma.agentTask.update({
-        //   where: { id: event.taskId },
-        //   data: {
-        //     status: "failed",
-        //     result: { error: event.error },
-        //   },
-        // });
-        // await redis.publish(`task:${event.taskId}`, JSON.stringify(event));
+        await prisma.agentTask.update({
+          where: { id: event.taskId },
+          data: {
+            status: "failed",
+            result: { error: event.error },
+          },
+        });
+        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
     }
 

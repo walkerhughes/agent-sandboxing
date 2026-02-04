@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import json
 import os
 from typing import Any, Literal
 import httpx
@@ -43,18 +44,20 @@ async def send_webhook(
         **payload
     }
 
-    # Create HMAC signature
-    body = str(event).encode()
+    # Serialize to JSON (must match what Vercel receives)
+    body = json.dumps(event, separators=(",", ":"))
+
+    # Create HMAC signature over the JSON body
     signature = hmac.new(
         webhook_secret.encode(),
-        body,
+        body.encode(),
         hashlib.sha256
     ).hexdigest()
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
             webhook_url,
-            json=event,
+            content=body,
             headers={
                 "Content-Type": "application/json",
                 "X-Webhook-Signature": signature,

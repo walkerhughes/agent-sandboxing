@@ -8,10 +8,21 @@ When AskUser is called:
 3. User responds via /api/agent/respond
 4. NEW container spawns with resume=session_id
 5. Claude SDK loads full context automatically
+
+Session Management (per Claude Agent SDK docs):
+https://platform.claude.com/docs/en/agent-sdk/sessions
+
+- First query creates a session, returns session_id in init message
+- Subsequent queries can resume with: ClaudeAgentOptions(resume=session_id)
+- The SDK automatically handles loading conversation history and context
 """
 
 import asyncio
 from typing import Any
+
+import modal
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -24,7 +35,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
-from .config import app, FUNCTION_CONFIG
+from .config import app, FUNCTION_CONFIG, WEB_ENDPOINT_CONFIG
 from .tools import AskUserException, create_ask_user_tool
 from .webhook import (
     send_session_started,
@@ -58,10 +69,10 @@ async def execute_agent(
     actions_taken: list[str] = []
 
     try:
-        # Create custom AskUser tool
+        # Create custom AskUser tool for human-in-the-loop
         ask_user_tool = create_ask_user_tool()
 
-        # Create MCP server with our tools
+        # Create MCP server with our custom tools
         agent_server = create_sdk_mcp_server(
             name="agent",
             version="1.0.0",
@@ -69,25 +80,33 @@ async def execute_agent(
         )
 
         # Configure agent options
+        # Per docs: use resume=session_id to continue a previous session
         options = ClaudeAgentOptions(
             # Use Claude Code's preset system prompt
             system_prompt={"type": "preset", "preset": "claude_code"},
             # Resume from previous session if provided
+            # The SDK automatically handles loading conversation history
             resume=resume_session_id,
-            # Standard coding tools + our AskUser
+            # Standard coding tools + our custom AskUser
             allowed_tools=[
                 "Bash", "Read", "Write", "Edit", "Glob", "Grep",
                 "mcp__agent__AskUser"
             ],
             # Auto-accept file edits (sandboxed environment)
             permission_mode="acceptEdits",
-            # Register our MCP server
+            # Register our MCP server with custom tools
             mcp_servers={"agent": agent_server},
             # Limit turns to prevent runaway
             max_turns=50,
         )
 
-        # Run agent with ClaudeSDKClient for better control
+        # Log resume status
+        if resume_session_id:
+            print(f"[Agent] Resuming session: {resume_session_id}")
+        else:
+            print("[Agent] Starting new session")
+
+        # Run agent with ClaudeSDKClient
         async with ClaudeSDKClient(options=options) as client:
             # Send the prompt
             await client.query(prompt)
@@ -95,10 +114,15 @@ async def execute_agent(
             # Process messages
             async for message in client.receive_messages():
                 # Capture session ID from init message
+                # Per docs: session_id is in message.data.get('session_id') for init messages
                 if isinstance(message, SystemMessage):
-                    if message.subtype == "init" and "session_id" in message.data:
-                        session_id = message.data["session_id"]
-                        await send_session_started(webhook_url, task_id, session_id)
+                    if message.subtype == "init":
+                        # Extract session_id using safe dict access
+                        if hasattr(message, 'data') and isinstance(message.data, dict):
+                            session_id = message.data.get("session_id")
+                            if session_id:
+                                print(f"[Agent] Session ID obtained: {session_id}")
+                                await send_session_started(webhook_url, task_id, session_id)
 
                 # Track assistant actions
                 elif isinstance(message, AssistantMessage):
@@ -123,22 +147,27 @@ async def execute_agent(
 
                 # Handle final result
                 elif isinstance(message, ResultMessage):
-                    session_id = message.session_id
+                    # Get session_id from result message
+                    if hasattr(message, 'session_id') and message.session_id:
+                        session_id = message.session_id
 
                     if message.is_error:
-                        await send_failed(webhook_url, task_id, message.result or "Unknown error")
+                        error_msg = message.result or "Unknown error"
+                        print(f"[Agent] Task failed: {error_msg}")
+                        await send_failed(webhook_url, task_id, error_msg)
                         return {
                             "session_id": session_id,
                             "status": "failed",
-                            "error": message.result,
+                            "error": error_msg,
                         }
 
                     # Success!
+                    print("[Agent] Task completed successfully")
                     result = {
                         "summary": message.result or "Task completed successfully",
                         "actions_taken": actions_taken,
-                        "usage": message.usage,
-                        "cost_usd": message.total_cost_usd,
+                        "usage": getattr(message, 'usage', None),
+                        "cost_usd": getattr(message, 'total_cost_usd', None),
                     }
                     await send_completed(webhook_url, task_id, session_id, result)
                     return {
@@ -149,6 +178,8 @@ async def execute_agent(
 
     except AskUserException as e:
         # Checkpoint! Send webhook and exit cleanly
+        # Container will exit after this - no idle billing
+        print(f"[Agent] AskUser checkpoint: {e.question}")
         if session_id:
             await send_clarification_needed(
                 webhook_url,
@@ -169,15 +200,20 @@ async def execute_agent(
             }
         else:
             # No session yet - this shouldn't happen
-            await send_failed(webhook_url, task_id, "AskUser called before session initialized")
+            error_msg = "AskUser called before session initialized"
+            print(f"[Agent] Error: {error_msg}")
+            await send_failed(webhook_url, task_id, error_msg)
             return {
                 "session_id": None,
                 "status": "failed",
-                "error": "AskUser called before session initialized"
+                "error": error_msg
             }
 
     except Exception as e:
         error_msg = str(e)
+        print(f"[Agent] Unexpected error: {error_msg}")
+        import traceback
+        traceback.print_exc()
         await send_failed(webhook_url, task_id, error_msg)
         return {
             "session_id": session_id,
@@ -186,6 +222,7 @@ async def execute_agent(
         }
 
     # Should not reach here
+    print("[Agent] Warning: Unexpected exit from agent loop")
     return {
         "session_id": session_id,
         "status": "unknown",
@@ -193,10 +230,70 @@ async def execute_agent(
     }
 
 
+# =============================================================================
+# Web Endpoint - HTTP trigger for spawning agent containers
+# =============================================================================
+
+@app.function(**WEB_ENDPOINT_CONFIG)
+@modal.fastapi_endpoint(method="POST")
+async def spawn_agent(request: Request) -> JSONResponse:
+    """
+    HTTP endpoint to spawn an agent task.
+
+    POST body:
+    {
+        "task_id": "uuid",
+        "prompt": "user task description",
+        "webhook_url": "https://your-app.vercel.app/api/agent/webhook",
+        "resume_session_id": "optional-session-id-for-resume"
+    }
+
+    Returns immediately with 202 Accepted, then runs agent asynchronously.
+    """
+    try:
+        body = await request.json()
+
+        task_id = body.get("task_id")
+        prompt = body.get("prompt")
+        webhook_url = body.get("webhook_url")
+        resume_session_id = body.get("resume_session_id")
+
+        if not task_id or not prompt or not webhook_url:
+            return JSONResponse(
+                {"error": "Missing required fields: task_id, prompt, webhook_url"},
+                status_code=400
+            )
+
+        # Log what we're doing
+        if resume_session_id:
+            print(f"[Spawn] Resuming task {task_id} with session {resume_session_id}")
+        else:
+            print(f"[Spawn] Starting new task {task_id}")
+
+        # Spawn the agent execution asynchronously (non-blocking)
+        # This creates a new container that runs independently
+        execute_agent.spawn(
+            task_id=task_id,
+            prompt=prompt,
+            webhook_url=webhook_url,
+            resume_session_id=resume_session_id,
+        )
+
+        return JSONResponse(
+            {"status": "accepted", "task_id": task_id},
+            status_code=202
+        )
+
+    except Exception as e:
+        print(f"[Spawn] Error: {str(e)}")
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500
+        )
+
+
 # Entry point for local testing
 if __name__ == "__main__":
-    import os
-
     async def test():
         result = await execute_agent.local(
             task_id="test-123",
