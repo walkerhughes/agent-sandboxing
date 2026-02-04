@@ -1,0 +1,78 @@
+// Prisma schema for Human-in-the-Loop Agent System
+// This schema supports the bifurcated architecture with checkpoint/resume pattern
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Chat sessions (user's conversation thread)
+model ChatSession {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Claude Agent SDK session ID for multi-turn conversation resume
+  // This allows the agent to maintain context across multiple tasks
+  agentSessionId String? @map("agent_session_id")
+
+  messages ChatMessage[]
+  tasks    AgentTask[]
+
+  @@map("chat_sessions")
+}
+
+// Chat messages (regular chat, not agent tasks)
+model ChatMessage {
+  id        String   @id @default(uuid())
+  sessionId String   @map("session_id")
+  role      String   // 'user' | 'assistant'
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("chat_messages")
+}
+
+// Agent tasks (action mode executions)
+model AgentTask {
+  id        String  @id @default(uuid())
+  sessionId String? @map("session_id")
+
+  // Task state: pending | running | awaiting_input | completed | failed | cancelled
+  status String @default("pending")
+
+  // Claude Agent SDK session ID (for multi-turn resume)
+  agentSessionId String? @map("agent_session_id")
+
+  // Original task prompt
+  taskPrompt String @map("task_prompt")
+
+  // Clarification state (when awaiting_input)
+  // Schema: { question: string, context: string, options?: string[] }
+  pendingClarification Json? @map("pending_clarification")
+
+  // Status updates (append-only log for real-time UI)
+  // Schema: { message: string, timestamp: string, tool?: string }[]
+  statusUpdates Json[] @default([]) @map("status_updates")
+
+  // Final result (when completed)
+  // Schema: { summary: string, actions_taken: string[], files_created?: string[] }
+  result Json?
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+
+  session ChatSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, status], name: "idx_agent_tasks_session_status")
+  @@map("agent_tasks")
+}
