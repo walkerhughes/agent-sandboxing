@@ -12,6 +12,37 @@ Container runs → AskUser tool called → Webhook sent → Container EXITS
 User responds → New container spawns with resume=sessionId → Agent continues
 ```
 
+## Features
+
+- **Unified Chat Interface**: Single chat with inline Action toggle—no mode switching
+- **Inline Agent Status**: Tool usage, progress, and clarifications render directly in the message stream
+- **Multi-Turn Context**: Session management preserves conversation history across tasks
+- **Checkpoint/Resume**: Containers exit when waiting for input, eliminating idle compute costs
+- **Real-Time Updates**: SSE streaming for live status updates
+
+## UI Preview
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  User: Build a todo app with React                         │
+│                                                            │
+│  Assistant: [Inline Status]                                │
+│    ● Agent is working...                                   │
+│    └─ Using Bash: npm create vite                          │
+│    └─ Using Write: creating App.tsx...                     │
+│                                                            │
+│  [or when awaiting input:]                                 │
+│  Assistant: [Inline Clarification]                         │
+│    ? Which styling approach do you prefer?                 │
+│    [Tailwind] [CSS Modules] [Styled Components]            │
+│    [________________] [Send]                               │
+│                                                            │
+├────────────────────────────────────────────────────────────┤
+│  [textarea input                                         ] │
+│  [Model ▼] [⚡ Action]                          [Submit ●] │
+└────────────────────────────────────────────────────────────┘
+```
+
 ## Architecture
 
 ```
@@ -23,7 +54,7 @@ User responds → New container spawns with resume=sessionId → Agent continues
         │                       ▼                       │
         │               ┌───────────────┐               │
         │               │   Postgres    │               │
-        │               │    (Neon)     │◀──────────────┤
+        │               │  (Supabase)   │◀──────────────┤
         │               └───────────────┘  session_id   │
         │                       │                       │
         │                       ▼                       │
@@ -33,68 +64,14 @@ User responds → New container spawns with resume=sessionId → Agent continues
                         └───────────────┘
 ```
 
-## Sequence Diagram
-
-```
-Browser                 Vercel                    Modal
-   │                       │                         │
-   │ 1. POST /api/chat     │                         │
-   │──────────────────────>│                         │
-   │<──────────────────────│ streaming response      │
-   │                       │                         │
-   │ 2. Toggle Action Mode │                         │
-   │ 3. POST /api/agent/start                        │
-   │──────────────────────>│ create task (pending)   │
-   │<──────────────────────│ { taskId }              │
-   │                       │                         │
-   │ 4. GET /api/agent/{taskId}/stream (SSE)         │
-   │──────────────────────>│ subscribe Redis         │
-   │                       │                         │
-   │                       │ 5. spawn Modal ────────>│
-   │                       │    (taskId, prompt,     │
-   │                       │     webhookUrl)         │
-   │                       │                         │
-   │                       │<─────────────────────── │ 6. webhook:
-   │                       │  session_started        │    session_started
-   │                       │  { sessionId }          │
-   │                       │                         │
-   │<── SSE: status_update │<── Redis publish        │
-   │                       │                         │
-   │                       │                         │ 7. Agent works...
-   │                       │                         │    calls AskUser
-   │                       │                         │
-   │                       │<─────────────────────── │ 8. webhook:
-   │                       │  clarification_needed   │    clarification
-   │                       │  { question, sessionId }│    → container EXITS
-   │                       │                         │
-   │<── SSE: clarification │<── Redis publish        │
-   │    { question }       │                         │
-   │                       │                         │
-   │ 9. User types answer  │                         │
-   │ 10. POST /api/agent/respond                     │
-   │──────────────────────>│ { taskId, response }    │
-   │                       │                         │
-   │                       │ 11. spawn NEW Modal ───>│ (resume: sessionId)
-   │                       │                         │
-   │                       │                         │ 12. Agent resumes
-   │                       │                         │     completes task
-   │                       │                         │
-   │                       │<─────────────────────── │ 13. webhook:
-   │                       │  completed              │     completed
-   │                       │  { result }             │     → container EXITS
-   │                       │                         │
-   │<── SSE: completed     │<── Redis publish        │
-   │    { summary }        │                         │
-```
-
 ## Tech Stack
 
 | Layer | Technology |
 |-------|------------|
-| Frontend | Next.js 14+ (App Router), React 18+, Tailwind CSS |
+| Frontend | Next.js 15 (App Router), React 18+, Tailwind CSS |
 | Chat SDK | Vercel AI SDK |
 | Backend | Vercel Serverless Functions |
-| Database | Neon (Postgres) + Prisma ORM |
+| Database | Supabase (Postgres) + Prisma ORM |
 | Pub/Sub | Upstash Redis |
 | Agent Runtime | Modal (sandboxed containers) |
 | Agent SDK | Claude Agent SDK (Python) |
@@ -112,10 +89,10 @@ When the agent needs user input:
 5. NEW container spawns with `resume=session_id`
 6. Claude SDK loads full conversation context automatically
 
-### 2. Session Management
+### 2. Multi-Turn Session Management
 
 ```python
-# Only store session_id string in Postgres
+# Session ID stored at ChatSession level for cross-task resume
 # Claude SDK handles all conversation state internally
 
 options = ClaudeAgentOptions(
@@ -126,19 +103,13 @@ options = ClaudeAgentOptions(
 )
 ```
 
-### 3. AskUser Tool (Webhook + Exception Pattern)
+Each new task in a chat session:
+1. Fetches recent conversation history from database
+2. Builds contextual prompt with history
+3. Passes previous `agentSessionId` for Claude SDK resume
+4. Agent continues with full awareness of prior work
 
-```python
-@tool("AskUser", "Ask the user for clarification", {...})
-async def ask_user(args):
-    raise AskUserException(
-        question=args["question"],
-        context=args["context"],
-        options=args.get("options", [])
-    )
-```
-
-### 4. Real-Time Updates
+### 3. Real-Time Updates
 
 ```
 Modal webhook → Vercel /api/agent/webhook → Redis PUBLISH
@@ -171,65 +142,125 @@ PENDING → RUNNING → COMPLETED
 
 ```
 agent-sandboxing/
-├── app/                      # Next.js App Router
-│   ├── api/
-│   │   ├── chat/             # Vercel AI SDK chat endpoint
-│   │   └── agent/            # Agent task endpoints
-│   │       ├── start/
-│   │       ├── respond/
-│   │       ├── webhook/
-│   │       └── [taskId]/stream/
-│   └── page.tsx              # Chat interface with mode toggle
-├── components/               # React components
-├── lib/
-│   ├── db.ts                 # Prisma client
-│   └── redis.ts              # Upstash Redis client
-├── modal_agent/              # Modal Python package
-│   ├── app.py                # Modal app config
-│   ├── executor.py           # Agent execution loop
-│   └── tools.py              # AskUser tool definition
-├── prisma/
-│   └── schema.prisma         # Database schema
-└── spec.md                   # Full product requirements
+├── frontend/ai-sdk-starter-deepinfra/   # Next.js frontend
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── chat/                    # Vercel AI SDK chat
+│   │   │   └── agent/                   # Agent task endpoints
+│   │   │       ├── start/
+│   │   │       ├── respond/
+│   │   │       ├── webhook/
+│   │   │       └── [taskId]/stream/
+│   │   └── page.tsx
+│   ├── components/
+│   │   ├── chat.tsx                     # Main chat component
+│   │   ├── inline-agent-status.tsx      # Inline status/clarification
+│   │   ├── textarea.tsx                 # Input with Action toggle
+│   │   └── ...
+│   ├── lib/
+│   │   ├── db.ts                        # Prisma client
+│   │   ├── modal.ts                     # Modal API client
+│   │   └── redis.ts                     # Upstash Redis client
+│   └── prisma/
+│       └── schema.prisma
+├── modal_agent/                         # Modal Python package
+│   ├── config.py                        # Modal app config
+│   ├── executor.py                      # Agent execution loop
+│   ├── tools.py                         # AskUser tool definition
+│   └── webhook.py                       # Webhook helpers
+└── tests/                               # Python tests
 ```
 
 ## Getting Started
-
-See the [Project Roadmap (Issue #20)](https://github.com/walkerhughes/agent-sandboxing/issues/20) for implementation phases and dependencies.
 
 ### Prerequisites
 
 - Node.js 18+
 - Python 3.11+
-- Modal account (`modal token new`)
-- Neon database
+- Modal account
+- Supabase database
 - Upstash Redis
 - Anthropic API key
 
-### Environment Variables
+### 1. Clone and Install
 
 ```bash
-DATABASE_URL=
-UPSTASH_REDIS_REST_URL=
-UPSTASH_REDIS_REST_TOKEN=
-ANTHROPIC_API_KEY=
-WEBHOOK_SECRET=
+git clone https://github.com/walkerhughes/agent-sandboxing.git
+cd agent-sandboxing
+
+# Frontend
+cd frontend/ai-sdk-starter-deepinfra
+npm install
+
+# Python (Modal agent)
+cd ../..
+uv sync  # or pip install -e .
 ```
 
-## Development Workflow
-
-This repo uses **git worktrees** for parallel development. See `CLAUDE.md` for the full workflow.
+### 2. Configure Environment
 
 ```bash
-# Create worktree for an issue
-git worktree add ../agent-sandbox-issue-1 -b feat/project-setup
-
-# Work in the worktree
-cd ../agent-sandbox-issue-1
-
-# Commit with issue reference
-git commit -m "feat(#1): add project scaffolding"
+cp .env.example .env
+# Edit .env with your credentials
 ```
+
+Required environment variables:
+```bash
+# Database (Supabase)
+DATABASE_URL=postgresql://...
+
+# Redis (Upstash)
+UPSTASH_REDIS_REST_URL=https://...
+UPSTASH_REDIS_REST_TOKEN=...
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Modal
+MODAL_TOKEN_ID=ak-...
+MODAL_TOKEN_SECRET=as-...
+
+# Webhook security
+WEBHOOK_SECRET=your-secret-here
+```
+
+### 3. Setup Database
+
+```bash
+cd frontend/ai-sdk-starter-deepinfra
+npx prisma db push
+```
+
+### 4. Deploy Modal Agent
+
+```bash
+# Authenticate with Modal
+modal token new
+
+# Deploy the agent
+modal deploy -m modal_agent.executor
+
+# Note the endpoint URL and add to .env:
+# MODAL_ENDPOINT_URL=https://your-workspace--human-in-the-loop-agent-spawn-agent.modal.run
+```
+
+### 5. Run Frontend
+
+```bash
+cd frontend/ai-sdk-starter-deepinfra
+npm run dev
+```
+
+For local development with webhooks, use a tunnel:
+```bash
+# In another terminal
+cloudflared tunnel --url http://localhost:3000
+# Add the tunnel URL to .env as PUBLIC_URL
+```
+
+## Development
+
+See [CLAUDE.md](./CLAUDE.md) for development guidelines and git worktree workflow.
 
 ## License
 
