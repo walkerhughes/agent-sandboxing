@@ -205,7 +205,7 @@ async def execute_agent(
                                 tool=tool_name
                             )
                         elif isinstance(block, TextBlock):
-                            if len(block.text) > 0:
+                            if block.text:
                                 await send_status_update(
                                     webhook_url,
                                     task_id,

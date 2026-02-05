@@ -19,22 +19,10 @@ from modal_agent.tools import (
 )
 
 
-class TestAskUserExceptionUnit:
+class TestAskUserException:
     """Unit tests for AskUserException."""
 
-    def test_exception_is_exception_subclass(self):
-        """AskUserException should be a proper Exception subclass."""
-        assert issubclass(AskUserException, Exception)
-
-    def test_exception_can_be_raised(self):
-        """AskUserException should be raisable."""
-        with pytest.raises(AskUserException):
-            raise AskUserException(
-                question="Test?",
-                context="Test context",
-            )
-
-    def test_exception_preserves_attributes_after_catch(self):
+    def test_preserves_all_attributes(self):
         """Exception attributes should be accessible after catching."""
         try:
             raise AskUserException(
@@ -47,82 +35,34 @@ class TestAskUserExceptionUnit:
             assert e.context == "Need X for Y"
             assert e.options == ["Option 1", "Option 2"]
 
-    def test_exception_with_empty_question(self):
-        """Exception should handle empty question string."""
-        exc = AskUserException(question="", context="Some context")
-        assert exc.question == ""
-
-    def test_exception_with_long_context(self):
-        """Exception should handle long context strings."""
-        long_context = "A" * 10000
-        exc = AskUserException(question="Q?", context=long_context)
-        assert len(exc.context) == 10000
-
-    def test_exception_with_many_options(self):
-        """Exception should handle many options."""
-        many_options = [f"Option {i}" for i in range(100)]
-        exc = AskUserException(
-            question="Choose one?",
-            context="Many choices",
-            options=many_options,
-        )
-        assert len(exc.options) == 100
-
-    def test_exception_options_is_list(self):
-        """Exception options should always be a list."""
-        exc = AskUserException(question="Q?", context="C")
-        assert isinstance(exc.options, list)
-
-    def test_exception_str_representation(self):
-        """Exception should have useful string representation."""
-        exc = AskUserException(
-            question="What color?",
-            context="Need to choose a color",
-        )
-        exc_str = str(exc)
-        assert "AskUser" in exc_str
-        assert "What color?" in exc_str
-
-    def test_exception_defaults_empty_options(self):
+    def test_defaults_empty_options(self):
         """AskUserException should default to empty options list."""
-        exc = AskUserException(
-            question="What is your name?",
-            context="Need user identification",
-        )
+        exc = AskUserException(question="Q?", context="C")
         assert exc.options == []
 
-    def test_exception_stores_question(self):
-        """AskUserException should store the question."""
-        exc = AskUserException(
-            question="What is the target directory?",
-            context="Need to know where to create files",
-        )
-        assert exc.question == "What is the target directory?"
+    def test_str_representation(self):
+        """Exception should have useful string representation."""
+        exc = AskUserException(question="What color?", context="Need to choose")
+        assert "AskUser" in str(exc)
+        assert "What color?" in str(exc)
 
-    def test_exception_stores_context(self):
-        """AskUserException should store the context."""
-        exc = AskUserException(
-            question="What is the target directory?",
-            context="Need to know where to create files",
-        )
-        assert exc.context == "Need to know where to create files"
+    def test_handles_edge_cases(self):
+        """Exception should handle empty strings and large inputs."""
+        empty = AskUserException(question="", context="Some context")
+        assert empty.question == ""
 
-    def test_exception_stores_options(self):
-        """AskUserException should store options when provided."""
-        exc = AskUserException(
-            question="Which framework?",
-            context="Multiple frameworks available",
-            options=["React", "Vue", "Svelte"],
+        long_ctx = AskUserException(question="Q?", context="A" * 10000)
+        assert len(long_ctx.context) == 10000
+
+        many_opts = AskUserException(
+            question="Choose?", context="C",
+            options=[f"Option {i}" for i in range(100)],
         )
-        assert exc.options == ["React", "Vue", "Svelte"]
+        assert len(many_opts.options) == 100
 
 
 class TestIdleTimeoutError:
     """Unit tests for IdleTimeoutError."""
-
-    def test_is_exception_subclass(self):
-        """IdleTimeoutError should be a proper Exception subclass."""
-        assert issubclass(IdleTimeoutError, Exception)
 
     def test_default_timeout(self):
         """IdleTimeoutError should use IDLE_TIMEOUT_SECONDS by default."""
@@ -136,18 +76,7 @@ class TestIdleTimeoutError:
 
     def test_message_contains_timeout(self):
         """Error message should mention the timeout duration."""
-        exc = IdleTimeoutError(timeout_seconds=300)
-        assert "300" in str(exc)
-
-    def test_can_be_raised_and_caught(self):
-        """IdleTimeoutError should be raisable and catchable."""
-        with pytest.raises(IdleTimeoutError) as exc_info:
-            raise IdleTimeoutError(timeout_seconds=120)
-        assert exc_info.value.timeout_seconds == 120
-
-
-class TestIdleTimeoutConstant:
-    """Test the IDLE_TIMEOUT_SECONDS constant."""
+        assert "300" in str(IdleTimeoutError(timeout_seconds=300))
 
     def test_idle_timeout_is_5_minutes(self):
         """IDLE_TIMEOUT_SECONDS should be 300 (5 minutes)."""
@@ -157,35 +86,19 @@ class TestIdleTimeoutConstant:
 class TestCreateAskUserTool:
     """Test the AskUser tool creation with callback pattern."""
 
-    def test_returns_tool_object(self):
-        """create_ask_user_tool should return a Tool dataclass."""
-        callback = AsyncMock(return_value="user response")
+    def test_returns_tool_with_correct_metadata(self):
+        """create_ask_user_tool should return a Tool with name and description."""
+        callback = AsyncMock(return_value="response")
         tool = create_ask_user_tool(callback)
         assert isinstance(tool, Tool)
-
-    def test_tool_name_is_ask_user(self):
-        """Tool name should be 'AskUser'."""
-        callback = AsyncMock(return_value="user response")
-        tool = create_ask_user_tool(callback)
         assert tool.name == "AskUser"
-
-    def test_tool_has_description(self):
-        """Tool should have a non-empty description mentioning clarification."""
-        callback = AsyncMock(return_value="user response")
-        tool = create_ask_user_tool(callback)
-        assert len(tool.description) > 0
         assert "clarification" in tool.description.lower()
-
-    def test_tool_has_callable_handler(self):
-        """Tool should have a callable handler."""
-        callback = AsyncMock(return_value="user response")
-        tool = create_ask_user_tool(callback)
         assert callable(tool.handler)
 
     @pytest.mark.asyncio
     async def test_handler_calls_callback_with_args(self):
         """Handler should pass question, context, and options to callback."""
-        callback = AsyncMock(return_value="user response")
+        callback = AsyncMock(return_value="response")
         tool = create_ask_user_tool(callback)
 
         await tool.handler({
@@ -195,9 +108,7 @@ class TestCreateAskUserTool:
         })
 
         callback.assert_called_once_with(
-            "Which DB?",
-            "Need a database",
-            ["Postgres", "MySQL"],
+            "Which DB?", "Need a database", ["Postgres", "MySQL"],
         )
 
     @pytest.mark.asyncio
@@ -219,35 +130,16 @@ class TestCreateAskUserTool:
         callback = AsyncMock(return_value="response")
         tool = create_ask_user_tool(callback)
 
-        await tool.handler({
-            "question": "What?",
-            "context": "Why?",
-        })
+        await tool.handler({"question": "What?", "context": "Why?"})
 
         callback.assert_called_once_with("What?", "Why?", [])
 
     @pytest.mark.asyncio
-    async def test_handler_propagates_callback_exception(self):
+    async def test_handler_propagates_exceptions(self):
         """Handler should propagate exceptions from the callback."""
-        callback = AsyncMock(side_effect=IdleTimeoutError(300))
-        tool = create_ask_user_tool(callback)
+        for exc in [IdleTimeoutError(300), AskUserException(question="Q?", context="C")]:
+            callback = AsyncMock(side_effect=exc)
+            tool = create_ask_user_tool(callback)
 
-        with pytest.raises(IdleTimeoutError):
-            await tool.handler({
-                "question": "Q?",
-                "context": "C",
-            })
-
-    @pytest.mark.asyncio
-    async def test_handler_propagates_ask_user_exception(self):
-        """Handler should propagate AskUserException from callback."""
-        callback = AsyncMock(side_effect=AskUserException(
-            question="Q?", context="C"
-        ))
-        tool = create_ask_user_tool(callback)
-
-        with pytest.raises(AskUserException):
-            await tool.handler({
-                "question": "Q?",
-                "context": "C",
-            })
+            with pytest.raises(type(exc)):
+                await tool.handler({"question": "Q?", "context": "C"})

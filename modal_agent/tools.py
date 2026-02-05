@@ -6,7 +6,6 @@ for the user's response (with a 5-minute idle timeout). The container
 stays alive for the entire conversation — no checkpoint/resume needed.
 """
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -77,16 +76,11 @@ Do NOT use this for:
 - Asking permission for every small step"""
 
     async def handler(args: dict[str, Any]) -> str:
-        """
-        Calls the on_ask_user callback to send the webhook and wait for
-        the user's response. Returns the response string as the tool result.
-        """
-        response = await on_ask_user(
+        return await on_ask_user(
             args["question"],
             args["context"],
             args.get("options", []),
         )
-        return response
 
     return Tool(
         name="AskUser",

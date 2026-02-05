@@ -1,31 +1,28 @@
 """
 Integration tests for the single-container-per-conversation architecture.
 
-These tests verify the complete lifecycle:
-1. New conversation → container spawned, queue created
+These tests verify the container lifecycle:
+1. New conversation → queue created, container spawned
 2. AskUser called → webhook sent, container blocks on queue
 3. User responds → response put on queue, container unblocks
 4. Multiple rounds of AskUser → same container, same queue
-5. Conversation completes → queue cleaned up
-6. Idle timeout → container exits, queue cleaned up
+5. Idle timeout → container exits with error
+6. Queue naming → deterministic per task_id
+
+Note: Webhook payload tests are in test_modal_executor.py.
+Note: AskUser tool unit tests are in tests/unit/test_tools.py.
 """
 
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from modal_agent.tools import (
-    AskUserException,
     IdleTimeoutError,
     IDLE_TIMEOUT_SECONDS,
     create_ask_user_tool,
 )
-from modal_agent.webhook import (
-    send_clarification_needed,
-    send_completed,
-    send_failed,
-    send_status_update,
-)
+from modal_agent.webhook import send_session_started
 
 
 def _queue_name(task_id: str) -> str:
@@ -33,69 +30,48 @@ def _queue_name(task_id: str) -> str:
     return f"agent-conv-{task_id}"
 
 
-class TestContainerLifecycleNewConversation:
-    """Test starting a new conversation (no resume_session_id)."""
+class TestQueueNaming:
+    """Test queue name generation."""
 
     def test_queue_name_format(self):
         """Queue name should follow the expected format."""
-        name = _queue_name("abc-123")
-        assert name == "agent-conv-abc-123"
+        assert _queue_name("abc-123") == "agent-conv-abc-123"
 
     def test_queue_name_handles_uuid(self):
         """Queue name should work with UUID-style task IDs."""
-        name = _queue_name("550e8400-e29b-41d4-a716-446655440000")
-        assert name == "agent-conv-550e8400-e29b-41d4-a716-446655440000"
+        assert _queue_name("550e8400-e29b-41d4-a716-446655440000") == \
+            "agent-conv-550e8400-e29b-41d4-a716-446655440000"
+
+    def test_queue_name_is_deterministic(self):
+        """Same task_id should always produce the same queue name."""
+        assert _queue_name("task-123") == _queue_name("task-123")
+
+    def test_queue_name_is_unique_per_task(self):
+        """Different task_ids should produce different queue names."""
+        assert _queue_name("task-1") != _queue_name("task-2")
+
+
+class TestNewConversation:
+    """Test starting a new conversation."""
 
     @pytest.mark.asyncio
     async def test_new_conversation_triggers_webhook(self):
-        """Starting a new conversation should eventually send session_started webhook."""
+        """Starting a new conversation should send session_started webhook."""
         with patch("modal_agent.webhook.send_webhook", new_callable=AsyncMock) as mock_send:
             mock_send.return_value = True
 
-            from modal_agent.webhook import send_session_started
             result = await send_session_started(
-                "http://localhost/webhook",
-                "task-new",
-                "sess-new",
+                "http://localhost/webhook", "task-new", "sess-new",
             )
 
             assert result is True
             call_args = mock_send.call_args[0]
             assert call_args[1] == "session_started"
-            assert call_args[2] == "task-new"
             assert call_args[3]["sessionId"] == "sess-new"
 
 
-class TestContainerLifecycleAskUser:
+class TestAskUserBlocking:
     """Test the AskUser blocking pattern within a single container."""
-
-    @pytest.mark.asyncio
-    async def test_ask_user_sends_clarification_webhook(self):
-        """AskUser should trigger a clarification_needed webhook."""
-        webhook_called = asyncio.Event()
-        response_queue = asyncio.Queue()
-
-        async def on_ask_user(question, context, options):
-            # Simulate sending webhook
-            webhook_called.set()
-            # Wait for response
-            return await asyncio.wait_for(response_queue.get(), timeout=5.0)
-
-        tool = create_ask_user_tool(on_ask_user)
-
-        # Start AskUser in background
-        task = asyncio.create_task(
-            tool.handler({"question": "Which DB?", "context": "Need DB"})
-        )
-
-        # Verify webhook was "sent" (event set)
-        await asyncio.wait_for(webhook_called.wait(), timeout=5.0)
-        assert webhook_called.is_set()
-
-        # Send response to unblock
-        await response_queue.put("PostgreSQL")
-        result = await asyncio.wait_for(task, timeout=5.0)
-        assert result == "PostgreSQL"
 
     @pytest.mark.asyncio
     async def test_ask_user_blocks_until_response(self):
@@ -108,20 +84,36 @@ class TestContainerLifecycleAskUser:
             return await asyncio.wait_for(response_queue.get(), timeout=5.0)
 
         tool = create_ask_user_tool(on_ask_user)
-
         task = asyncio.create_task(
             tool.handler({"question": "Q?", "context": "C"})
         )
 
-        # Verify we're blocking
         await asyncio.wait_for(is_blocking.wait(), timeout=5.0)
-        assert not task.done()  # Should still be waiting
+        assert not task.done()
 
-        # Now send response
         await response_queue.put("Answer")
         result = await asyncio.wait_for(task, timeout=5.0)
         assert result == "Answer"
-        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_full_flow_webhook_then_queue_response(self):
+        """Full flow: send webhook → block on queue → user responds → return."""
+        webhook_sent = asyncio.Event()
+        response_queue = asyncio.Queue()
+
+        async def on_ask_user(question, context, options):
+            webhook_sent.set()
+            return await asyncio.wait_for(response_queue.get(), timeout=5.0)
+
+        tool = create_ask_user_tool(on_ask_user)
+        task = asyncio.create_task(
+            tool.handler({"question": "Which DB?", "context": "Need DB"})
+        )
+
+        await asyncio.wait_for(webhook_sent.wait(), timeout=5.0)
+        await response_queue.put("PostgreSQL")
+        result = await asyncio.wait_for(task, timeout=5.0)
+        assert result == "PostgreSQL"
 
     @pytest.mark.asyncio
     async def test_ask_user_with_options_preserved(self):
@@ -142,7 +134,7 @@ class TestContainerLifecycleAskUser:
         assert captured_options == ["A", "B", "C"]
 
 
-class TestContainerLifecycleMultiTurn:
+class TestMultiTurnConversation:
     """Test multiple AskUser rounds in the same container."""
 
     @pytest.mark.asyncio
@@ -198,46 +190,7 @@ class TestContainerLifecycleMultiTurn:
         assert results == responses
 
 
-class TestContainerLifecycleCompletion:
-    """Test conversation completion and cleanup."""
-
-    @pytest.mark.asyncio
-    async def test_completed_webhook_sent(self):
-        """Completion should trigger a completed webhook."""
-        with patch("modal_agent.webhook.send_webhook", new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = True
-
-            result = await send_completed(
-                "http://localhost/webhook",
-                "task-done",
-                "sess-done",
-                {"summary": "Done!", "actions_taken": ["Write"]},
-            )
-
-            assert result is True
-            call_args = mock_send.call_args[0]
-            assert call_args[1] == "completed"
-            assert call_args[3]["result"]["summary"] == "Done!"
-
-    @pytest.mark.asyncio
-    async def test_failed_webhook_sent(self):
-        """Failure should trigger a failed webhook."""
-        with patch("modal_agent.webhook.send_webhook", new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = True
-
-            result = await send_failed(
-                "http://localhost/webhook",
-                "task-fail",
-                "Something went wrong",
-            )
-
-            assert result is True
-            call_args = mock_send.call_args[0]
-            assert call_args[1] == "failed"
-            assert call_args[3]["error"] == "Something went wrong"
-
-
-class TestContainerLifecycleTimeout:
+class TestIdleTimeout:
     """Test idle timeout behavior."""
 
     @pytest.mark.asyncio
@@ -254,31 +207,13 @@ class TestContainerLifecycleTimeout:
         assert exc_info.value.timeout_seconds == 300
 
     @pytest.mark.asyncio
-    async def test_idle_timeout_sends_failed_webhook(self):
-        """Idle timeout should result in a failed webhook being sent."""
-        with patch("modal_agent.webhook.send_webhook", new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = True
-
-            error_msg = f"Conversation timed out: no response within {IDLE_TIMEOUT_SECONDS} seconds"
-            result = await send_failed(
-                "http://localhost/webhook",
-                "task-timeout",
-                error_msg,
-            )
-
-            assert result is True
-            call_args = mock_send.call_args[0]
-            assert "timed out" in call_args[3]["error"]
-
-    @pytest.mark.asyncio
     async def test_short_timeout_simulation(self):
         """Simulate a very short timeout to verify the timeout path."""
         queue = asyncio.Queue()
 
         async def on_ask_user(question, context, options):
             try:
-                response = await asyncio.wait_for(queue.get(), timeout=0.05)
-                return response
+                return await asyncio.wait_for(queue.get(), timeout=0.05)
             except asyncio.TimeoutError:
                 raise IdleTimeoutError(0)
 
@@ -286,29 +221,6 @@ class TestContainerLifecycleTimeout:
 
         with pytest.raises(IdleTimeoutError):
             await tool.handler({"question": "Q?", "context": "C"})
-
-
-class TestQueueCleanup:
-    """Test queue cleanup on conversation end."""
-
-    def test_queue_name_deletion_path(self):
-        """Verify the queue name used for cleanup matches creation."""
-        task_id = "task-cleanup-test"
-        create_name = _queue_name(task_id)
-        # The executor uses the same _queue_name function for both
-        # creation (from_name) and deletion (delete)
-        assert create_name == f"agent-conv-{task_id}"
-
-    @pytest.mark.asyncio
-    async def test_queue_cleanup_does_not_raise_on_missing(self):
-        """Queue cleanup should not raise if the queue is already gone."""
-        # Simulate the cleanup try/except pattern from executor.py
-        try:
-            # Simulate a deletion that fails (queue doesn't exist)
-            raise Exception("Queue not found")
-        except Exception:
-            # This is expected — cleanup should be best-effort
-            pass
 
 
 class TestConfigValues:
@@ -323,10 +235,6 @@ class TestConfigValues:
         """WEB_ENDPOINT_CONFIG timeout should still be 60s."""
         from modal_agent.config import WEB_ENDPOINT_CONFIG
         assert WEB_ENDPOINT_CONFIG["timeout"] == 60
-
-    def test_idle_timeout_is_5_minutes(self):
-        """IDLE_TIMEOUT_SECONDS should be 300."""
-        assert IDLE_TIMEOUT_SECONDS == 300
 
     def test_idle_timeout_less_than_function_timeout(self):
         """Idle timeout should be less than the function timeout."""
