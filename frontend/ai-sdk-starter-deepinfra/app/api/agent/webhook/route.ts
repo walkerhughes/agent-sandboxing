@@ -154,6 +154,7 @@ export async function POST(req: Request) {
       }
 
       case "failed":
+        console.error(`[Webhook] Task ${event.taskId} failed with error: ${event.error}`);
         await prisma.agentTask.update({
           where: { id: event.taskId },
           data: {

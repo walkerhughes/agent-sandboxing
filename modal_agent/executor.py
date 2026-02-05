@@ -190,8 +190,24 @@ async def execute_agent(
                         session_id = message.session_id
 
                     if message.is_error:
+                        # Try to extract as much error info as possible
                         error_msg = message.result or "Unknown error"
-                        print(f"[Agent] Task failed: {error_msg}")
+
+                        # Log all available message attributes for debugging
+                        print(f"[Agent] Task failed with error: {error_msg}")
+                        print(f"[Agent] ResultMessage details - result: {message.result}, "
+                              f"session_id: {getattr(message, 'session_id', 'N/A')}, "
+                              f"subtype: {getattr(message, 'subtype', 'N/A')}")
+
+                        # Check if there's additional error context in the message
+                        for attr in ['error', 'error_code', 'error_details', 'data']:
+                            if hasattr(message, attr):
+                                val = getattr(message, attr)
+                                if val:
+                                    print(f"[Agent] Additional error info - {attr}: {val}")
+                                    if error_msg == "Unknown error" and isinstance(val, str):
+                                        error_msg = val
+
                         await send_failed(webhook_url, task_id, error_msg)
                         return {
                             "session_id": session_id,
@@ -248,15 +264,22 @@ async def execute_agent(
             }
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"[Agent] Unexpected error: {error_msg}")
         import traceback
-        traceback.print_exc()
-        await send_failed(webhook_url, task_id, error_msg)
+
+        error_msg = str(e)
+        full_traceback = traceback.format_exc()
+
+        print(f"[Agent] Unexpected error: {error_msg}")
+        print(f"[Agent] Exception type: {type(e).__name__}")
+        print(f"[Agent] Full traceback:\n{full_traceback}")
+
+        # Include exception type in error message for better debugging
+        detailed_error = f"{type(e).__name__}: {error_msg}"
+        await send_failed(webhook_url, task_id, detailed_error)
         return {
             "session_id": session_id,
             "status": "failed",
-            "error": error_msg,
+            "error": detailed_error,
         }
 
     # Should not reach here
