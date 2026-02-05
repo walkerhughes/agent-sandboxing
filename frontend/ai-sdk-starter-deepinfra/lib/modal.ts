@@ -1,8 +1,13 @@
 /**
- * Modal API client for spawning agent containers.
+ * Modal API client for agent containers.
  *
- * Calls the Modal web endpoint to spawn new containers for each action request.
- * Each container has cached dependencies (Node.js, Claude Code CLI) for fast cold starts.
+ * Single-container architecture:
+ * - For NEW conversations: calls the Modal endpoint which spawns a new container.
+ * - For RESPONSES: calls the same endpoint, which puts the response on a
+ *   modal.Queue that the existing container is blocking on.
+ *
+ * The Modal endpoint distinguishes between the two cases by the presence
+ * of resume_session_id in the request body.
  */
 
 const MODAL_ENDPOINT_URL = process.env.MODAL_ENDPOINT_URL;
@@ -23,15 +28,19 @@ interface SpawnAgentOptions {
 interface SpawnAgentResponse {
   status: "accepted";
   task_id: string;
+  action: "container_spawned" | "response_queued";
 }
 
 /**
- * Spawn a Modal container to execute an agent task.
+ * Spawn a Modal container or send a response to an existing one.
  *
- * Makes HTTP POST to Modal web endpoint, which:
- * 1. Accepts the request immediately (202)
- * 2. Spawns a new container asynchronously
- * 3. Container sends webhooks back to Vercel as it progresses
+ * When resumeSessionId is NOT set:
+ *   - Creates a modal.Queue for the conversation
+ *   - Spawns a new container that runs for the full conversation
+ *
+ * When resumeSessionId IS set:
+ *   - Puts the prompt (user's response) on the existing container's Queue
+ *   - The container's AskUser tool unblocks and returns the response to the agent
  */
 export async function spawnModalAgent(options: SpawnAgentOptions): Promise<SpawnAgentResponse> {
   const { taskId, prompt, webhookUrl, resumeSessionId, chatContext } = options;
@@ -42,7 +51,8 @@ export async function spawnModalAgent(options: SpawnAgentOptions): Promise<Spawn
     );
   }
 
-  console.log("[Modal] Spawning agent container:", {
+  const action = resumeSessionId ? "routing response to queue" : "spawning container";
+  console.log(`[Modal] ${action}:`, {
     taskId,
     prompt: prompt.slice(0, 100) + (prompt.length > 100 ? "..." : ""),
     webhookUrl,
@@ -60,17 +70,17 @@ export async function spawnModalAgent(options: SpawnAgentOptions): Promise<Spawn
       prompt,
       webhook_url: webhookUrl,
       resume_session_id: resumeSessionId,
-      chat_context: chatContext, // Pass to Modal for system prompt injection
+      chat_context: chatContext,
     }),
   });
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Modal spawn failed (${response.status}): ${error}`);
+    throw new Error(`Modal request failed (${response.status}): ${error}`);
   }
 
   const result = await response.json() as SpawnAgentResponse;
-  console.log("[Modal] Agent container spawned:", result);
+  console.log("[Modal] Request accepted:", result);
 
   return result;
 }
@@ -83,9 +93,4 @@ export async function spawnModalAgent(options: SpawnAgentOptions): Promise<Spawn
  */
 export async function cancelModalAgent(taskId: string): Promise<void> {
   console.log("[Modal] Cancel requested for task:", taskId);
-
-  // Modal spawned functions can't be directly cancelled.
-  // Instead, we update the task status in the database to "cancelled"
-  // and the agent checks this status periodically or via webhook.
-  // The actual cancellation is handled by the webhook/database layer.
 }

@@ -1,10 +1,13 @@
 /**
  * POST /api/agent/respond
  *
- * Submit a clarification response and resume the agent.
- * This triggers the checkpoint/resume pattern:
- * 1. Update task status to "running"
- * 2. Spawn NEW Modal container with resume=sessionId
+ * Submit a clarification response to the running agent container.
+ *
+ * Single-container architecture:
+ * Instead of spawning a NEW container with resume=sessionId,
+ * we send the response to the EXISTING container via the Modal endpoint.
+ * The container's AskUser tool is blocked on a modal.Queue — putting the
+ * response on the queue unblocks it and the agent continues.
  */
 
 import { NextResponse } from "next/server";
@@ -59,13 +62,12 @@ export async function POST(req: Request) {
     });
 
     // Build webhook URL
-    // Use PUBLIC_URL for tunneled local dev (ngrok/cloudflared), VERCEL_URL for prod
     const baseUrl = process.env.PUBLIC_URL || process.env.VERCEL_URL || "http://localhost:3000";
     const webhookUrl = `${baseUrl}/api/agent/webhook`;
 
-    // Spawn NEW Modal container with resume session ID
-    // The response becomes the new prompt, and the session ID allows
-    // Claude SDK to load the full conversation context
+    // Send response to the EXISTING container via the Modal endpoint.
+    // The spawn endpoint detects resume_session_id and routes the message
+    // to the container's queue instead of spawning a new container.
     await spawnModalAgent({
       taskId,
       prompt: response,
@@ -73,7 +75,7 @@ export async function POST(req: Request) {
       resumeSessionId: task.agentSessionId,
     });
 
-    console.log(`[Agent Respond] Resuming task ${taskId} with session ${task.agentSessionId}`);
+    console.log(`[Agent Respond] Sent response to container for task ${taskId}`);
 
     return NextResponse.json({ ok: true });
   } catch (error) {
