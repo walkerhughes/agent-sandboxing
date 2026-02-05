@@ -51,17 +51,11 @@ User responds → New container spawns with resume=sessionId → Agent continues
 │   (React/Next)  │────▶│  (Serverless)   │────▶│   (Sandboxed)   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
         │                       │                       │
-        │                       ▼                       │
-        │               ┌───────────────┐               │
+        │  SSE (DB polling)     ▼                       │
+        │◀──────────    ┌───────────────┐               │
         │               │   Postgres    │               │
         │               │  (Supabase)   │◀──────────────┤
-        │               └───────────────┘  session_id   │
-        │                       │                       │
-        │                       ▼                       │
-        │               ┌───────────────┐               │
-        └───────────────│     Redis     │◀──────────────┘
-            SSE         │   (Upstash)   │   webhook/pub
-                        └───────────────┘
+        │               └───────────────┘   webhooks    │
 ```
 
 ## Tech Stack
@@ -72,7 +66,6 @@ User responds → New container spawns with resume=sessionId → Agent continues
 | Chat SDK | Vercel AI SDK |
 | Backend | Vercel Serverless Functions |
 | Database | Supabase (Postgres) + Prisma ORM |
-| Pub/Sub | Upstash Redis |
 | Agent Runtime | Modal (sandboxed containers) |
 | Agent SDK | Claude Agent SDK (Python) |
 | LLM | Claude Sonnet 4.5 |
@@ -112,9 +105,9 @@ Each new task in a chat session:
 ### 3. Real-Time Updates
 
 ```
-Modal webhook → Vercel /api/agent/webhook → Redis PUBLISH
-                                                   ↓
-Browser ←─────── SSE ←─────── Vercel /api/agent/{taskId}/stream
+Modal webhook → Vercel /api/agent/webhook → Postgres (update task)
+                                                      ↓
+Browser ←─── SSE (DB polling) ←── Vercel /api/agent/{taskId}/stream
 ```
 
 ## Task State Machine
@@ -159,8 +152,7 @@ agent-sandboxing/
 │   │   └── ...
 │   ├── lib/
 │   │   ├── db.ts                        # Prisma client
-│   │   ├── modal.ts                     # Modal API client
-│   │   └── redis.ts                     # Upstash Redis client
+│   │   └── modal.ts                     # Modal API client
 │   └── prisma/
 │       └── schema.prisma
 ├── modal_agent/                         # Modal Python package
@@ -179,7 +171,6 @@ agent-sandboxing/
 - Python 3.11+
 - Modal account
 - Supabase database
-- Upstash Redis
 - Anthropic API key
 
 ### 1. Clone and Install
@@ -208,10 +199,6 @@ Required environment variables:
 ```bash
 # Database (Supabase)
 DATABASE_URL=postgresql://...
-
-# Redis (Upstash)
-UPSTASH_REDIS_REST_URL=https://...
-UPSTASH_REDIS_REST_TOKEN=...
 
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-...

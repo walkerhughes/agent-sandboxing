@@ -16,7 +16,6 @@ This is a **Human-in-the-Loop Agent System** with a bifurcated architecture:
 | Chat SDK | Vercel AI SDK |
 | Backend | Vercel Serverless Functions |
 | Database | Neon (Postgres) + Prisma ORM |
-| Pub/Sub | Upstash Redis |
 | Agent Runtime | Modal (sandboxed containers) |
 | Agent SDK | Claude Agent SDK (TypeScript) |
 | LLM | Claude Sonnet 4.5 |
