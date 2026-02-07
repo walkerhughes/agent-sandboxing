@@ -1,4 +1,10 @@
-"""Modal app configuration for the agent executor."""
+"""Modal app configuration for the agent executor.
+
+Architecture: Single container per conversation.
+The container stays alive for the full conversation, using a modal.Queue
+for inter-request communication. Timeout is 30 minutes (hard limit),
+with a 5-minute idle timeout per AskUser call.
+"""
 
 from pathlib import Path
 
@@ -45,18 +51,19 @@ SECRETS = [
 ]
 
 # Function configuration for agent executor
+# Timeout is 30 minutes — the container handles the full conversation
 FUNCTION_CONFIG = {
     "image": image,
     "secrets": SECRETS,
-    "timeout": 600,  # 10 min max per execution segment
-    "retries": 0,    # Don't retry - let Vercel handle
+    "timeout": 1800,  # 30 min hard limit for entire conversation
+    "retries": 0,     # Don't retry - let Vercel handle
 }
 
 # Web endpoint configuration (no retries allowed)
 WEB_ENDPOINT_CONFIG = {
     "image": image,
     "secrets": SECRETS,
-    "timeout": 60,  # Web endpoint just spawns, doesn't run agent
+    "timeout": 60,  # Web endpoint just spawns or routes messages
 }
 
 # Remote path where .claude folder is mounted in the container

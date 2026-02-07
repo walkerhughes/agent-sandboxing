@@ -7,7 +7,7 @@
  * Key features:
  * - Associates tasks with a ChatSession for conversation continuity
  * - Fetches recent task history to inject context into the prompt
- * - Passes the session's agentSessionId for Claude SDK resume capability
+ * - Always spawns a NEW container (never passes resumeSessionId)
  */
 
 import { NextResponse } from "next/server";
@@ -151,15 +151,14 @@ export async function POST(req: Request) {
     const baseUrl = process.env.PUBLIC_URL || process.env.VERCEL_URL || "http://localhost:3000";
     const webhookUrl = `${baseUrl}/api/agent/webhook`;
 
-    // Spawn Modal container with session context
-    // If the session has an agentSessionId, we can resume the Claude SDK session
-    // Pass chatContext for system prompt injection (Chat Mode conversation)
+    // Spawn a NEW Modal container for this task.
+    // Never pass resumeSessionId here — start always creates a new container.
+    // Only respond/route.ts passes resumeSessionId (to route to an existing container's queue).
     await spawnModalAgent({
       taskId,
-      prompt: task, // Just the user's task, not the contextualPrompt (context goes in system prompt)
+      prompt: task,
       webhookUrl,
-      resumeSessionId: session.agentSessionId || undefined,
-      chatContext: chatContext || [], // Chat Mode messages for system prompt append
+      chatContext: chatContext || [],
     });
 
     // Update task status to running
@@ -169,9 +168,6 @@ export async function POST(req: Request) {
     });
 
     console.log(`[Agent Start] Created task ${taskId} for session ${session.id}`);
-    if (session.agentSessionId) {
-      console.log(`[Agent Start] Resuming Claude session: ${session.agentSessionId}`);
-    }
     if (history.length > 0) {
       console.log(`[Agent Start] Included ${history.length} history items in context`);
     }

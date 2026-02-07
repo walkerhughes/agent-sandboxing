@@ -1,18 +1,25 @@
-"""Custom tools for the agent, including AskUser for human-in-the-loop."""
+"""Custom tools for the agent, including AskUser for human-in-the-loop.
+
+Architecture: Single container per conversation.
+When AskUser is called, the tool handler blocks on a modal.Queue waiting
+for the user's response (with a 5-minute idle timeout). The container
+stays alive for the entire conversation — no checkpoint/resume needed.
+"""
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+
+# Idle timeout: how long to wait for a user response before timing out
+IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
 class AskUserException(Exception):
     """
-    Exception raised when the agent needs user input.
+    Exception raised when the agent needs user input but the session
+    is not yet initialized (no session_id available).
 
-    This triggers the checkpoint/resume pattern:
-    1. Container sends webhook with question
-    2. Container exits (no idle compute)
-    3. User responds via /api/agent/respond
-    4. NEW container spawns with resume=session_id
+    In normal operation with the blocking AskUser tool, this is only
+    raised as a fallback error condition.
     """
 
     def __init__(self, question: str, context: str, options: list[str] | None = None):
@@ -20,6 +27,14 @@ class AskUserException(Exception):
         self.context = context
         self.options = options or []
         super().__init__(f"AskUser: {question}")
+
+
+class IdleTimeoutError(Exception):
+    """Raised when the container times out waiting for a user response."""
+
+    def __init__(self, timeout_seconds: int = IDLE_TIMEOUT_SECONDS):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"No user response within {timeout_seconds} seconds")
 
 
 @dataclass
@@ -30,11 +45,23 @@ class Tool:
     handler: Callable
 
 
-def create_ask_user_tool() -> Tool:
+# Type alias for the callback that sends a webhook and waits for a response
+AskUserCallback = Callable[[str, str, list[str]], Awaitable[str]]
+
+
+def create_ask_user_tool(on_ask_user: AskUserCallback) -> Tool:
     """
     Create the AskUser tool for the agent.
 
-    When called, this raises AskUserException to checkpoint the agent.
+    Args:
+        on_ask_user: Async callback that:
+            1. Sends the clarification webhook to Vercel
+            2. Blocks waiting for the user's response on the modal.Queue
+            3. Returns the user's response string
+
+    When called by the agent, this tool invokes the callback and returns
+    the user's response as the tool result. The container stays alive
+    during the wait — no checkpoint/resume needed.
     """
     description = """Ask the user for clarification when you need more information to proceed.
 Use this when:
@@ -48,15 +75,11 @@ Do NOT use this for:
 - Rhetorical questions
 - Asking permission for every small step"""
 
-    async def handler(args: dict[str, Any]) -> dict[str, Any]:
-        """
-        This tool raises an exception to trigger checkpoint/resume.
-        The executor catches this and handles the webhook/exit flow.
-        """
-        raise AskUserException(
-            question=args["question"],
-            context=args["context"],
-            options=args.get("options", [])
+    async def handler(args: dict[str, Any]) -> str:
+        return await on_ask_user(
+            args["question"],
+            args["context"],
+            args.get("options", []),
         )
 
     return Tool(
