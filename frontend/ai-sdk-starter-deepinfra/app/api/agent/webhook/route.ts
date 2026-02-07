@@ -2,7 +2,7 @@
  * POST /api/agent/webhook
  *
  * Receive events from Modal agent containers.
- * Events update the database and are published to Redis for real-time SSE delivery.
+ * Events update the database; the SSE endpoint polls the database for changes.
  *
  * Key feature: Stores agentSessionId at BOTH task and session level
  * for multi-turn conversation resume capability.
@@ -11,7 +11,6 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { prisma } from "@/lib/db";
-import { publish } from "@/lib/redis";
 
 // Webhook event types from Modal
 type WebhookEvent =
@@ -78,13 +77,11 @@ export async function POST(req: Request) {
           });
           console.log(`[Webhook] Updated ChatSession ${task.sessionId} with agentSessionId ${event.sessionId}`);
         }
-
-        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
       }
 
       case "status_update":
-        // Append to status updates and publish to Redis for real-time UI
+        // Append to status updates (SSE endpoint polls DB for changes)
         await prisma.agentTask.update({
           where: { id: event.taskId },
           data: {
@@ -97,7 +94,7 @@ export async function POST(req: Request) {
             },
           },
         });
-        await publish(`task:${event.taskId}`, JSON.stringify(event));
+
         break;
 
       case "clarification_needed": {
@@ -123,8 +120,6 @@ export async function POST(req: Request) {
             data: { agentSessionId: event.sessionId },
           });
         }
-
-        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
       }
 
@@ -148,8 +143,6 @@ export async function POST(req: Request) {
           });
           console.log(`[Webhook] Task completed, ChatSession ${task.sessionId} agentSessionId updated`);
         }
-
-        await publish(`task:${event.taskId}`, JSON.stringify(event));
         break;
       }
 
@@ -162,7 +155,7 @@ export async function POST(req: Request) {
             result: { error: event.error },
           },
         });
-        await publish(`task:${event.taskId}`, JSON.stringify(event));
+
         break;
     }
 

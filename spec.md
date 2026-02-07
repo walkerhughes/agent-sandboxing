@@ -49,7 +49,7 @@ This document specifies a bifurcated agent architecture that separates conversat
 │  │   /api/chat     │  │  /api/agent/*   │  │  /api/agent/[id]/stream    │  │
 │  │                 │  │                 │  │                             │  │
 │  │  Vercel AI SDK  │  │  • POST /start  │  │  SSE endpoint               │  │
-│  │  streaming chat │  │  • POST /respond│  │  Subscribes to Redis        │  │
+│  │  streaming chat │  │  • POST /respond│  │  Polls Postgres for changes │  │
 │  │                 │  │  • POST /cancel │  │  Pushes events to browser   │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────────────────┘  │
 │           │                   │                         ▲                    │
@@ -57,14 +57,13 @@ This document specifies a bifurcated agent architecture that separates conversat
 │           ▼                   ▼                         │                    │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │                         Shared Infrastructure                          │ │
-│  │  ┌──────────────────────┐      ┌──────────────────────────────────┐   │ │
-│  │  │   Postgres (Neon)    │      │       Redis (Upstash)            │   │ │
-│  │  │                      │      │                                  │   │ │
-│  │  │  • Chat sessions     │      │  • Pub/Sub channels              │   │ │
-│  │  │  • Agent tasks       │      │    task:{taskId}                 │   │ │
-│  │  │  • SDK session IDs   │      │  • Real-time event delivery      │   │ │
-│  │  │  • Task results      │      │  • No persistence (fire-forget)  │   │ │
-│  │  └──────────────────────┘      └──────────────────────────────────┘   │ │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │ │
+│  │  │                    Postgres (Supabase)                      │   │ │
+│  │  │                                                            │   │ │
+│  │  │  • Chat sessions          • Status updates (append-only)   │   │ │
+│  │  │  • Agent tasks            • Task results                   │   │ │
+│  │  │  • SDK session IDs        • SSE polls DB for changes       │   │ │
+│  │  └──────────────────────────────────────────────────────────────┘   │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -127,76 +126,50 @@ This document specifies a bifurcated agent architecture that separates conversat
 │                         HAPPY PATH: Task with Clarification                  │
 └─────────────────────────────────────────────────────────────────────────────┘
 
- Browser                 Vercel                  Redis              Modal
-    │                       │                      │                   │
-    │  1. Toggle "Action"   │                      │                   │
-    │  2. Submit task       │                      │                   │
-    │ ─────────────────────▶│                      │                   │
-    │                       │  3. Create task      │                   │
-    │                       │     record (pending) │                   │
-    │                       │                      │                   │
-    │                       │  4. Spawn container ─────────────────────▶
-    │                       │                      │                   │
-    │  5. Connect SSE       │                      │                   │
-    │ ─────────────────────▶│  6. Subscribe ──────▶│                   │
-    │                       │     task:{id}        │                   │
-    │                       │                      │                   │
-    │                       │                      │  7. Agent starts  │
-    │                       │                      │     Claude SDK    │
-    │                       │                      │         │         │
-    │                       │                      │  8. session_started
-    │                       │◀─────────────────────────────────────────│
-    │                       │  9. Update DB        │                   │
-    │                       │     (sessionId)      │                   │
-    │                       │                      │                   │
-    │                       │                      │  10. Agent works  │
-    │                       │                      │      ...          │
-    │                       │                      │                   │
-    │                       │                      │  11. status_update│
-    │                       │◀─────────────────────────────────────────│
-    │                       │  12. Publish ───────▶│                   │
-    │  13. SSE event        │◀─────────────────────│                   │
-    │◀──────────────────────│                      │                   │
-    │                       │                      │                   │
-    │                       │                      │  14. AskUser tool │
-    │                       │                      │      called       │
-    │                       │                      │                   │
-    │                       │                      │  15. clarification│
-    │                       │◀─────────────────────────────────────────│
-    │                       │  16. Update DB       │                   │
-    │                       │      (awaiting)      │                   │
-    │                       │  17. Publish ───────▶│                   │
-    │  18. SSE clarification│◀─────────────────────│  19. Container    │
-    │◀──────────────────────│                      │      EXITS        │
-    │                       │                      │      (no idle $)  │
-    │  [User sees question] │                      │                   │
-    │                       │                      │                   │
-    │  20. User responds    │                      │                   │
-    │ ─────────────────────▶│                      │                   │
-    │                       │  21. Update DB       │                   │
-    │                       │      (running)       │                   │
-    │                       │                      │                   │
-    │                       │  22. Spawn NEW container ────────────────▶
-    │                       │      (resume: sessionId,                 │
-    │                       │       prompt: userResponse)              │
-    │                       │                      │                   │
-    │                       │                      │  23. SDK resumes  │
-    │                       │                      │      full context │
-    │                       │                      │                   │
-    │                       │                      │  24. Agent        │
-    │                       │                      │      continues... │
-    │                       │                      │                   │
-    │                       │                      │  25. completed    │
-    │                       │◀─────────────────────────────────────────│
-    │                       │  26. Update DB       │                   │
-    │                       │      (completed)     │                   │
-    │                       │  27. Publish ───────▶│                   │
-    │  28. SSE completed    │◀─────────────────────│  29. Container    │
-    │◀──────────────────────│                      │      exits        │
-    │                       │                      │                   │
-    │  [User sees summary]  │                      │                   │
-    │  [Chat mode restored] │                      │                   │
-    │                       │                      │                   │
+ Browser                 Vercel                              Modal
+    │                       │                                     │
+    │  1. Toggle "Action"   │                                     │
+    │  2. Submit task       │                                     │
+    │ ─────────────────────▶│                                     │
+    │                       │  3. Create task record (pending)    │
+    │                       │  4. Spawn container ───────────────▶│
+    │                       │                                     │
+    │  5. Connect SSE       │                                     │
+    │ ─────────────────────▶│  6. Start DB polling                │
+    │                       │                                     │
+    │                       │                  7. Agent starts    │
+    │                       │                     Claude SDK      │
+    │                       │                  8. session_started │
+    │                       │◀────────────────────────────────────│
+    │                       │  9. Update DB (sessionId)           │
+    │                       │                                     │
+    │                       │                  10. Agent works... │
+    │                       │                  11. status_update  │
+    │                       │◀────────────────────────────────────│
+    │                       │  12. Update DB                      │
+    │  13. SSE event        │                                     │
+    │◀──────────────────────│  (DB poll detects change)           │
+    │                       │                                     │
+    │                       │                  14. AskUser tool   │
+    │                       │                  15. clarification  │
+    │                       │◀────────────────────────────────────│
+    │                       │  16. Update DB (awaiting_input)     │
+    │  17. SSE clarification│                  18. Container EXITS│
+    │◀──────────────────────│                      (no idle $)    │
+    │                       │                                     │
+    │  [User sees question] │                                     │
+    │  19. User responds    │                                     │
+    │ ─────────────────────▶│  20. Update DB (running)            │
+    │                       │  21. Spawn NEW container ──────────▶│
+    │                       │      (resume: sessionId)            │
+    │                       │                  22. SDK resumes    │
+    │                       │                  23. Agent continues│
+    │                       │                  24. completed      │
+    │                       │◀────────────────────────────────────│
+    │                       │  25. Update DB (completed)          │
+    │  26. SSE completed    │                  27. Container exits│
+    │◀──────────────────────│                                     │
+    │  [User sees summary]  │                                     │
 ```
 
 ---
@@ -251,7 +224,6 @@ This document specifies a bifurcated agent architecture that separates conversat
 | Backend | Vercel Serverless Functions | Co-located with frontend, auto-scaling |
 | Database | Neon (Postgres) | Serverless Postgres, Vercel integration |
 | ORM | Prisma | Type-safe queries, migrations |
-| Pub/Sub | Upstash Redis | Serverless Redis, Vercel integration |
 | Agent Runtime | Modal | Sandboxed containers, pay-per-second |
 | Agent SDK | Claude Agent SDK (TypeScript) | Session management, tool execution |
 | LLM | Claude Sonnet 4.5 | Balance of capability and speed |
@@ -375,42 +347,9 @@ type WebhookEvent =
 { ok: boolean }
 ```
 
-### 4.4 Redis Pub/Sub Design
+### 4.4 Real-Time Updates
 
-#### Channel Naming Convention
-```
-task:{taskId}
-```
-
-#### Message Format
-```typescript
-interface RedisMessage {
-  type: 'status_update' | 'clarification_needed' | 'completed' | 'failed';
-  taskId: string;
-  timestamp: string;
-  payload: any;  // Type-specific data
-}
-```
-
-#### Publishing (in webhook handler)
-```typescript
-await redis.publish(`task:${taskId}`, JSON.stringify({
-  type: event.type,
-  taskId: event.taskId,
-  timestamp: new Date().toISOString(),
-  payload: event,
-}));
-```
-
-#### Subscribing (in SSE endpoint)
-```typescript
-const subscriber = redis.duplicate();
-await subscriber.subscribe(`task:${taskId}`);
-
-subscriber.on('message', (channel, message) => {
-  controller.enqueue(`data: ${message}\n\n`);
-});
-```
+Real-time updates use database polling via the SSE endpoint. The webhook handler writes events to Postgres, and the SSE endpoint (`/api/agent/[taskId]/stream`) polls the database every second for changes.
 
 ### 4.5 Modal Agent Configuration
 
@@ -527,7 +466,7 @@ Do NOT use this for:
 
 | Category | Examples | Handling Strategy |
 |----------|----------|-------------------|
-| **Transient** | Network timeout, Redis connection drop | Retry with backoff |
+| **Transient** | Network timeout, DB connection drop | Retry with backoff |
 | **User Error** | Invalid task, malformed input | Surface to user, allow retry |
 | **Agent Error** | Tool execution failure, Claude refusal | Log, surface summary, allow retry |
 | **System Error** | Modal crash, DB unavailable | Alert, graceful degradation |
@@ -1082,54 +1021,6 @@ alerts:
 | **Phase 5: Hardening** | Auth, security, observability, testing | 1 week |
 
 ---
-
-## Appendix A: Redis Pub/Sub Learning Notes
-
-Since Redis pub/sub is a learning goal, here are key concepts:
-
-### A.1 How Pub/Sub Works
-
-```
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│  Publisher   │         │    Redis     │         │  Subscriber  │
-│   (Modal)    │────────▶│   Server     │────────▶│   (Vercel)   │
-└──────────────┘ PUBLISH └──────────────┘ MESSAGE └──────────────┘
-                channel    Holds NO data    Receives in
-                message    Just routes      real-time
-```
-
-**Key characteristics:**
-1. **Fire-and-forget**: Messages are NOT persisted. If no one is subscribed, message is lost.
-2. **Fan-out**: Multiple subscribers receive the same message.
-3. **No acknowledgment**: Publisher doesn't know if anyone received.
-
-### A.2 Why This Works for Status Updates
-
-- **Acceptable loss**: If a status update is missed, the next one provides context
-- **Real-time priority**: We want instant delivery, not guaranteed delivery
-- **Postgres backup**: Important state (clarifications, results) is in Postgres, not just Redis
-
-### A.3 When NOT to Use Pub/Sub
-
-- ❌ Critical events that must not be lost (use a queue like SQS, or Postgres)
-- ❌ Events that need to be replayed (use Redis Streams instead)
-- ❌ Events with ordering guarantees across publishers
-
-### A.4 Upstash-Specific Notes
-
-```typescript
-import { Redis } from '@upstash/redis';
-
-// For publishing (REST-based, works in serverless)
-const redis = Redis.fromEnv();
-await redis.publish('channel', JSON.stringify(data));
-
-// For subscribing (requires WebSocket connection)
-// Use @upstash/redis's Pub/Sub or ioredis
-import { createClient } from 'redis';
-const subscriber = createClient({ url: process.env.REDIS_URL });
-await subscriber.subscribe('channel', (message) => { ... });
-```
 
 ---
 
